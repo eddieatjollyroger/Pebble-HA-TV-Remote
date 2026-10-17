@@ -65,26 +65,37 @@ function fetchTVListFromHA() {
   xhr.send();
 }
 
-// Uses Joshua Galea's verified, whitelisted Pebble settings domain path
 Pebble.addEventListener('showConfiguration', function(e) {
-  Pebble.openURL('https://github.io');
+  var currentUrl = localStorage.getItem('ha_url') || '';
+  var currentToken = localStorage.getItem('ha_token') || '';
+  var returnUrl = e.return_url || 'pebblejs://close#';
+  
+  var myGitHubPage = 'https://eddieatjollyroger.github.io/Pebble-HA-TV-Remote/';
+  
+  var finalUrl = myGitHubPage + 
+                 '?url=' + encodeURIComponent(currentUrl) + 
+                 '&token=' + encodeURIComponent(currentToken) + 
+                 '&return_to=' + encodeURIComponent(returnUrl);
+                 
+  Pebble.openURL(finalUrl);
 });
 
-Pebble.addEventListener('webkitclosedconfiguration', function(e) {
+// FIXED: Listen to the correct native webviewclosed keyword event listener hook
+Pebble.addEventListener('webviewclosed', function(e) {
   if (e.response) {
     try {
       var configData = JSON.parse(decodeURIComponent(e.response));
-      // The official page saves keys as 'url' and 'token'
-      if (configData.url && configData.token) {
-        localStorage.setItem('ha_url', configData.url);
-        localStorage.setItem('ha_token', configData.token);
-        console.log("Credentials securely committed to app cache!");
+      
+      if (configData.ha_url && configData.ha_token) {
+        localStorage.setItem('ha_url', configData.ha_url);
+        localStorage.setItem('ha_token', configData.ha_token);
+        console.log("Credentials saved directly into LocalStorage container cache!");
         
-        // Immediately look up the TV list from your server
+        // Auto-refresh the configuration pipeline right away
         fetchTVListFromHA();
       }
     } catch(err) {
-      console.log("Error reading data dictionary: " + err);
+      console.log("JSON Configuration decode exception error: " + err);
     }
   }
 });
