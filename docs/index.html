@@ -28,8 +28,8 @@
         <button id="save_btn">Save Configuration</button>
     </div>
 
-    <script>
-        // Parse current values passed from Pebble app URL strings to keep inputs filled
+        <script>
+        // Helper to grab values from the URL query parameters
         function getQueryParam(variable) {
             var query = window.location.search.substring(1);
             var vars = query.split('&');
@@ -40,6 +40,7 @@
             return '';
         }
 
+        // Fill fields with current saved settings so they are never blank
         document.getElementById('ha_url').value = getQueryParam('url');
         document.getElementById('ha_token').value = getQueryParam('token');
 
@@ -49,10 +50,13 @@
                 ha_token: document.getElementById('ha_token').value.trim()
             };
 
-            // This tells the Pebble phone app shell to securely save the configurations payload
+            // Grab the secure callback path provided by the mobile app, or default to the legacy one
             var return_to = getQueryParam('return_to') || 'pebblejs://close#';
+            
+            // Push data back to the phone app
             document.location = return_to + encodeURIComponent(JSON.stringify(config));
         });
     </script>
+
 </body>
 </html>
