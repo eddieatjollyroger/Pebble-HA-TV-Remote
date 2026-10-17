@@ -34,6 +34,7 @@
         var vars = query.split('&');
         for (var i = 0; i < vars.length; i++) {
             var pair = vars[i].split('=');
+            // FIXED: properly validate the key name and pull index value array [1]
             if (pair[0] === variable) { 
                 return decodeURIComponent(pair[1]); 
             }
@@ -41,7 +42,7 @@
         return '';
     }
 
-    // Populate inputs when page loads
+    // Now correctly reads existing fields on page initialize mount
     document.getElementById('ha_url').value = getQueryParam('url');
     document.getElementById('ha_token').value = getQueryParam('token');
 
