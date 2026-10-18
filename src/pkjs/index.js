@@ -8,6 +8,11 @@ var MEDIA_OVERRIDES = {
 var mediaMap = {};      // remote entity -> media_player entity (guessed from names)
 var pollTimer = null;
 
+// Theme chosen on the settings page: 'dark' (default) or 'light'. Sent to the watch as 0 / 1.
+function themeValue() {
+  return localStorage.getItem('theme') === 'light' ? 1 : 0;
+}
+
 // Polling: every 5 s while the remote is in use, once a minute when idle
 var ACTIVE_MS = 30000;
 var lastActivity = Date.now();
@@ -105,12 +110,12 @@ function stateTag(s) {
   }
 }
 
+// Fallback when the template lookup isn't available: guess the media_player from names
 function buildMediaMap(states, remotes) {
-  var players = states.filter(function(s) { return s.entity_id.indexOf('media_player.') === 0; });
-  mediaMap = {};
+  var players = states.filter(function(st) { return st.entity_id.indexOf('media_player.') === 0; });
+  var map = {};
   remotes.forEach(function(r) {
-    if (MEDIA_OVERRIDES[r.entity_id]) { mediaMap[r.entity_id] = MEDIA_OVERRIDES[r.entity_id]; return; }
-    var rs = r.entity_id.slice(7);               // after "remote."
+    var rs = r.id.slice(7);                      // after "remote."
     var best = null, bestScore = -1;
     players.forEach(function(p) {
       var ps = p.entity_id.slice(13);            // after "media_player."
@@ -119,8 +124,9 @@ function buildMediaMap(states, remotes) {
       else if (rs.indexOf(ps) === 0 || ps.indexOf(rs) === 0) score = Math.min(ps.length, rs.length);
       if (score > bestScore) { best = p; bestScore = score; }
     });
-    if (best) mediaMap[r.entity_id] = best.entity_id;
+    if (best) map[r.id] = best.entity_id;
   });
+  return map;
 }
 
 function isActive() { return Date.now() - lastActivity < ACTIVE_MS; }
@@ -139,44 +145,6 @@ function noteActivity() {
   if (wasIdle) { pollNowPlaying(); schedulePoll(); }
 }
 
-// Ask HA which media_player belongs to the same device as each remote.
-// This is far more reliable than matching entity names.
-function resolveMediaPlayers(done) {
-  var haUrl = localStorage.getItem('ha_url');
-  var haToken = localStorage.getItem('ha_token');
-  if (!haUrl || !haToken) { done(); return; }
-  if (haUrl.charAt(haUrl.length - 1) === '/') haUrl = haUrl.slice(0, -1);
-
-  var tpl = "{% for r in states.remote %}{% set d = device_id(r.entity_id) %}{% if d %}" +
-            "{% for e in device_entities(d) %}{% if e.startswith('media_player.') %}" +
-            "{{ r.entity_id }}={{ e }};{% endif %}{% endfor %}{% endif %}{% endfor %}";
-
-  var xhr = new XMLHttpRequest();
-  xhr.open('POST', haUrl + '/api/template', true);
-  xhr.setRequestHeader("Authorization", "Bearer " + haToken);
-  xhr.setRequestHeader("Content-Type", "application/json");
-  xhr.onload = function() {
-    if (xhr.status === 200) {
-      var seen = {};
-      xhr.responseText.split(';').forEach(function(pair) {
-        var kv = pair.split('=');
-        if (kv.length !== 2) return;
-        var r = kv[0].replace(/^\s+|\s+$/g, '');
-        var m = kv[1].replace(/^\s+|\s+$/g, '');
-        if (!r || !m || seen[r] || MEDIA_OVERRIDES[r]) return;
-        seen[r] = true;
-        mediaMap[r] = m;
-      });
-    } else {
-      console.log("template lookup failed: " + xhr.status + " " + xhr.responseText);
-    }
-    console.log("media map: " + JSON.stringify(mediaMap));
-    done();
-  };
-  xhr.onerror = function() { console.log("template lookup network error"); done(); };
-  xhr.send(JSON.stringify({ template: tpl }));
-}
-
 function pollNowPlaying() {
   var haUrl = localStorage.getItem('ha_url');
   var haToken = localStorage.getItem('ha_token');
@@ -184,7 +152,10 @@ function pollNowPlaying() {
   if (haUrl.charAt(haUrl.length - 1) === '/') haUrl = haUrl.slice(0, -1);
 
   var mp = MEDIA_OVERRIDES[activeEntityId] || mediaMap[activeEntityId];
-  if (!mp) { enqueueNowPlaying({ '6': 'NO MP', '10': 0, '11': 0 }); return; }
+  if (!mp) {
+    if (tvCache) enqueueNowPlaying({ '6': 'NO MP', '10': 0, '11': 0 });   // lookup done, none found
+    return;
+  }
 
   var xhr = new XMLHttpRequest();
   xhr.open('GET', haUrl + "/api/states/" + mp, true);
@@ -196,10 +167,13 @@ function pollNowPlaying() {
     var a = st.attributes || {};
     var tag = stateTag(st.state);
     var off = (tag === 'OFF' || tag === 'OFFLINE');
+    console.log('media_player ' + mp + ' state=' + st.state + ' attrs=' + Object.keys(a).join(','));
 
-    var title = off ? '' : (a.media_title || '');
-    var sub = off ? '' : (a.media_artist || a.media_series_title || a.media_album_name || '');
-    var app = off ? '' : (a.app_name || '');
+    // Show whatever HA reports, even when its state says "off": some Apple TVs
+    // report the wrong power state while still exposing what's playing.
+    var title = a.media_title || '';
+    var sub = a.media_artist || a.media_series_title || a.media_album_name || '';
+    var app = a.app_name || '';
 
     var dur = Math.round(a.media_duration || 0);
     var pos = Math.round(a.media_position || 0);
@@ -208,7 +182,7 @@ function pollNowPlaying() {
       if (!isNaN(t)) pos += Math.max(0, Math.round((Date.now() - t) / 1000));
     }
     if (dur > 0 && pos > dur) pos = dur;
-    if (off) { pos = 0; dur = 0; }
+    if (off && !title) { pos = 0; dur = 0; }
 
     var payload = { '6': tag, '10': pos, '11': dur };
     if (title) payload['7'] = String(title).substring(0, 60);
@@ -221,56 +195,143 @@ function pollNowPlaying() {
 
 /* ---------- TV list ---------- */
 
-function fetchTVListFromHA() {
+// The list and the remote -> media_player map are cached on the phone, so launching
+// the app never waits on Home Assistant before showing now-playing.
+var tvCache = null;   // [{ id: 'remote.x', name: 'X' }, ...]
+
+function loadCaches() {
+  try { tvCache = JSON.parse(localStorage.getItem('tv_cache') || 'null'); } catch (e) { tvCache = null; }
+  try { mediaMap = JSON.parse(localStorage.getItem('media_map') || '{}') || {}; } catch (e) { mediaMap = {}; }
+}
+
+function saveCaches() {
+  try {
+    localStorage.setItem('tv_cache', JSON.stringify(tvCache));
+    localStorage.setItem('media_map', JSON.stringify(mediaMap));
+  } catch (e) { }
+}
+
+function trim(str) { return String(str || '').replace(/^\s+|\s+$/g, ''); }
+
+// Older/odd setups: download all states (large) and pick out the remotes
+function fetchRemotesFromStates(done) {
   var haUrl = localStorage.getItem('ha_url');
   var haToken = localStorage.getItem('ha_token');
-  if (!haUrl || !haToken) return;
+  if (!haUrl || !haToken) { done(null); return; }
   if (haUrl.charAt(haUrl.length - 1) === '/') haUrl = haUrl.slice(0, -1);
 
   var xhr = new XMLHttpRequest();
   xhr.open('GET', haUrl + "/api/states", true);
   xhr.setRequestHeader("Authorization", "Bearer " + haToken);
+  xhr.onload = function() {
+    if (xhr.status !== 200) { done(null); return; }
+    var states = JSON.parse(xhr.responseText);
+    var remotes = states.filter(function(it) { return it.entity_id.indexOf('remote.') === 0; })
+      .map(function(it) { return { id: it.entity_id, name: it.attributes.friendly_name || it.entity_id }; });
+    done(remotes, buildMediaMap(states, remotes));
+  };
+  xhr.onerror = function() { done(null); };
+  xhr.send();
+}
 
+// One small template call returns every remote, its name, and the media_player on the
+// same device. Much lighter than downloading every entity in Home Assistant.
+function fetchRemotes(done) {
+  var haUrl = localStorage.getItem('ha_url');
+  var haToken = localStorage.getItem('ha_token');
+  if (!haUrl || !haToken) { done(null); return; }
+  if (haUrl.charAt(haUrl.length - 1) === '/') haUrl = haUrl.slice(0, -1);
+
+  var tpl = "{% for r in states.remote %}{{ r.entity_id }}\t{{ r.name }}\t" +
+            "{% set d = device_id(r.entity_id) %}{% if d %}{% for e in device_entities(d) %}" +
+            "{% if e.startswith('media_player.') %}{{ e }} {% endif %}{% endfor %}{% endif %}\n{% endfor %}";
+
+  var xhr = new XMLHttpRequest();
+  xhr.open('POST', haUrl + '/api/template', true);
+  xhr.setRequestHeader("Authorization", "Bearer " + haToken);
+  xhr.setRequestHeader("Content-Type", "application/json");
   xhr.onload = function() {
     if (xhr.status === 200) {
-      var states = JSON.parse(xhr.responseText);
-      var remotes = states.filter(function(item) { return item.entity_id.indexOf('remote.') === 0; });
-
-      // If the saved TV is missing or gone, default to the first remote so buttons always work
-      var found = remotes.some(function(r) { return r.entity_id === activeEntityId; });
-      if (!found && remotes.length) {
-        activeEntityId = remotes[0].entity_id;
-        localStorage.setItem('active_tv_entity', activeEntityId);
-      }
-
-      buildMediaMap(states, remotes);
-
-      // A fresh list replaces anything still waiting to be sent
-      sendQueue = [];
-
-      enqueue({ '2': remotes.length });
-
-      var activeFriendlyName = "";
-      remotes.forEach(function(remote) {
-        var name = remote.attributes.friendly_name || remote.entity_id;
-        if (remote.entity_id === activeEntityId) activeFriendlyName = name;
-        enqueue({ '3': name, '4': remote.entity_id });
+      var remotes = [], map = {};
+      xhr.responseText.split('\n').forEach(function(line) {
+        var p = line.split('\t');
+        var id = trim(p[0]);
+        if (id.indexOf('remote.') !== 0) return;
+        remotes.push({ id: id, name: trim(p[1]) || id });
+        var mp = trim(p[2]).split(' ')[0];
+        if (mp) map[id] = mp;
       });
-
-      // Tell the watch which TV is active so the title and highlight are right
-      if (activeFriendlyName) enqueue({ '5': activeFriendlyName });
-
-      resolveMediaPlayers(function() { pollNowPlaying(); });
+      if (remotes.length) { done(remotes, map); return; }
     }
+    console.log("template lookup unusable (" + xhr.status + "), falling back to /api/states");
+    fetchRemotesFromStates(done);
   };
-  xhr.send();
+  xhr.onerror = function() { console.log("template lookup network error"); done(null); };
+  xhr.send(JSON.stringify({ template: tpl }));
+}
+
+// Store a fresh list + map. Returns true if anything changed.
+function applyRemotes(remotes, map) {
+  var newMap = {};
+  Object.keys(map || {}).forEach(function(k) { newMap[k] = map[k]; });
+  remotes.forEach(function(r) { if (MEDIA_OVERRIDES[r.id]) newMap[r.id] = MEDIA_OVERRIDES[r.id]; });
+
+  var changed = JSON.stringify(remotes) !== JSON.stringify(tvCache) ||
+                JSON.stringify(newMap) !== JSON.stringify(mediaMap);
+  tvCache = remotes;
+  mediaMap = newMap;
+  saveCaches();
+
+  // If the saved TV is missing or gone, default to the first remote so buttons always work
+  var found = remotes.some(function(r) { return r.id === activeEntityId; });
+  if (!found && remotes.length) {
+    activeEntityId = remotes[0].id;
+    localStorage.setItem('active_tv_entity', activeEntityId);
+    changed = true;
+  }
+  console.log("media map: " + JSON.stringify(mediaMap));
+  return changed;
+}
+
+function sendListToWatch() {
+  if (!tvCache) return;
+  // Replace any older list messages still waiting; leave now-playing alone
+  sendQueue = sendQueue.filter(function(i) {
+    var p = i.payload;
+    return p['2'] === undefined && p['3'] === undefined && p['5'] === undefined;
+  });
+
+  enqueue({ '2': tvCache.length });
+  var activeName = "";
+  tvCache.forEach(function(r) {
+    if (r.id === activeEntityId) activeName = r.name;
+    enqueue({ '3': r.name, '4': r.id });
+  });
+  // Tell the watch which TV is active so the title and highlight are right
+  if (activeName) enqueue({ '5': activeName });
+}
+
+// Refresh from Home Assistant. Resends the list to the watch if asked to, or if it changed.
+function refreshRemotes(sendToWatch) {
+  fetchRemotes(function(remotes, map) {
+    if (!remotes) return;
+    var changed = applyRemotes(remotes, map || {});
+    if (sendToWatch || changed) sendListToWatch();
+    if (changed) pollNowPlaying();
+  });
 }
 
 Pebble.addEventListener('ready', function(e) {
   activeEntityId = localStorage.getItem('active_tv_entity') || "";
   lastActivity = Date.now();
-  fetchTVListFromHA();
+  loadCaches();
+
+  enqueue({ '12': themeValue() });   // keep the watch's theme in sync
+  pollNowPlaying();                  // uses the cached media map: no waiting on HA
   schedulePoll();
+
+  // Refresh the list and map in the background. First run has no cache, so do it now.
+  setTimeout(function() { refreshRemotes(false); }, tvCache ? 3000 : 0);
 });
 
 Pebble.addEventListener('showConfiguration', function(e) {
@@ -279,6 +340,7 @@ Pebble.addEventListener('showConfiguration', function(e) {
   var returnUrl = e.return_url || 'pebblejs://close#';
   Pebble.openURL('https://eddieatjollyroger.github.io/Pebble-HA-TV-Remote/?url=' +
     encodeURIComponent(currentUrl) + '&token=' + encodeURIComponent(currentToken) +
+    '&theme=' + (themeValue() ? 'light' : 'dark') +
     '&return_to=' + encodeURIComponent(returnUrl));
 });
 
@@ -286,10 +348,16 @@ Pebble.addEventListener('webviewclosed', function(e) {
   if (e.response) {
     try {
       var configData = JSON.parse(decodeURIComponent(e.response));
+      if (configData.theme === 'light' || configData.theme === 'dark') {
+        localStorage.setItem('theme', configData.theme);
+      }
       if (configData.ha_url && configData.ha_token) {
         localStorage.setItem('ha_url', configData.ha_url);
         localStorage.setItem('ha_token', configData.ha_token);
-        fetchTVListFromHA();
+        enqueue({ '12': themeValue() });
+        refreshRemotes(true);
+      } else {
+        enqueue({ '12': themeValue() });
       }
     } catch(err) {
       console.log("Config parse error: " + err);
@@ -303,7 +371,9 @@ Pebble.addEventListener('appmessage', function(e) {
   if (e.payload['0'] !== undefined) {
     sendCommandToHA(e.payload['0']);
   } else if (e.payload['1'] !== undefined) {
-    fetchTVListFromHA();
+    // The watch opened its TV list: answer from the cache right away, then refresh quietly
+    if (tvCache) { sendListToWatch(); refreshRemotes(false); }
+    else refreshRemotes(true);
   } else if (e.payload['5'] !== undefined) {
     // User picked a TV from the watch menu
     activeEntityId = e.payload['5'];
