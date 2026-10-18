@@ -1,5 +1,47 @@
 #include <pebble.h>
 
+/* ---------- Sizing: bigger fonts and spacing on Pebble Time 2 (Emery) ---------- */
+
+#if defined(PBL_PLATFORM_EMERY)
+  #define FONT_S   FONT_KEY_GOTHIC_18
+  #define FONT_SB  FONT_KEY_GOTHIC_18_BOLD
+  #define FONT_M   FONT_KEY_GOTHIC_24
+  #define FONT_MB  FONT_KEY_GOTHIC_24_BOLD
+  #define LH_S 20            // line height, small font
+  #define LH_M 28            // line height, medium font
+  #define PAD 6
+  #define HDR_H 22
+  #define PROMPT_Y 26
+  #define TITLE_GAP 4
+  #define BAR_H 10
+  #define SEG_STEP 5
+  #define SEG_W 4
+  #define TAG_W 92
+  #define CLOCK_W 54
+  #define MENU_HEADER_H 24
+  #define ROW_H_SHORT 36
+  #define ROW_H_TALL 52
+#else
+  #define FONT_S   FONT_KEY_GOTHIC_14
+  #define FONT_SB  FONT_KEY_GOTHIC_14_BOLD
+  #define FONT_M   FONT_KEY_GOTHIC_18
+  #define FONT_MB  FONT_KEY_GOTHIC_18_BOLD
+  #define LH_S 16
+  #define LH_M 22
+  #define PAD 4
+  #define HDR_H 18
+  #define PROMPT_Y 22
+  #define TITLE_GAP 0
+  #define BAR_H 8
+  #define SEG_STEP 4
+  #define SEG_W 3
+  #define TAG_W 66
+  #define CLOCK_W 40
+  #define MENU_HEADER_H 19
+  #define ROW_H_SHORT 27
+  #define ROW_H_TALL 40
+#endif
+
 static Window *s_main_window;
 static Layer *s_ui_layer;
 
@@ -43,7 +85,6 @@ static AppTimer *s_tick_timer = NULL;
 
 // Power saving: tick every second only while the remote is in use
 #define ACTIVE_SECS 30        // "in use" = a button was pressed in the last 30 s
-#define IDLE_TICK_MS 60000    // when idle, refresh once a minute
 static time_t s_last_activity = 0;
 static time_t s_last_tick = 0;
 static bool s_tick_idle = false;
@@ -70,7 +111,7 @@ enum {
 #define MENU_ROWS 5
 
 static const char *s_mode_labels[] = {
-  "> mode: left/right", "> mode: up/down", "> mode: volume"
+  "> left/right", "> up/down", "> volume"
 };
 
 static void ui_redraw(void) {
@@ -113,6 +154,17 @@ static void fmt_time(char *buf, size_t n, int32_t secs) {
   else snprintf(buf, n, "%d:%02d", (int)m, (int)s);
 }
 
+static void fmt_clock(char *buf, size_t n) {
+  time_t now = time(NULL);
+  struct tm *t = localtime(&now);
+  if (clock_is_24h_style()) {
+    strftime(buf, n, "%H:%M", t);
+  } else {
+    strftime(buf, n, "%I:%M", t);
+    if (buf[0] == '0') memmove(buf, buf + 1, strlen(buf));   // 07:05 -> 7:05
+  }
+}
+
 static void draw_text(GContext *ctx, const char *text, GFont font, GRect rect,
                       GTextAlignment align, GColor color) {
   graphics_context_set_text_color(ctx, color);
@@ -124,74 +176,73 @@ static void ui_update_proc(Layer *layer, GContext *ctx) {
   int w = b.size.w;
   int h = b.size.h;
 
-  GFont f14 = fonts_get_system_font(FONT_KEY_GOTHIC_14);
-  GFont f14b = fonts_get_system_font(FONT_KEY_GOTHIC_14_BOLD);
-  GFont f18 = fonts_get_system_font(FONT_KEY_GOTHIC_18);
-  GFont f18b = fonts_get_system_font(FONT_KEY_GOTHIC_18_BOLD);
+  GFont fs = fonts_get_system_font(FONT_S);
+  GFont fsb = fonts_get_system_font(FONT_SB);
+  GFont fm = fonts_get_system_font(FONT_M);
+  GFont fmb = fonts_get_system_font(FONT_MB);
 
   bool playing = strcmp(s_np_state, "PLAY") == 0;
   bool paused = strcmp(s_np_state, "PAUSE") == 0;
   bool off = strcmp(s_np_state, "OFF") == 0 || strcmp(s_np_state, "OFFLINE") == 0;
 
   // Layout, anchored to the bottom so it adapts to the screen height
-  int footer_y = h - 18;
-  int times_y = h - 36;
-  int bar_y = times_y - 10;
-  int app_y = bar_y - 18;
-  int sub_y = app_y - 17;
-  int title_y = 38;
+  int footer_y = h - LH_S - 2;
+  int times_y = footer_y - LH_S - 2;
+  int bar_y = times_y - BAR_H - 4;
+  int app_y = bar_y - LH_S - 2;
+  int sub_y = app_y - LH_S;
+  int title_y = PROMPT_Y + LH_S + TITLE_GAP;
   int title_h = sub_y - title_y - 1;
 
   char buf[80];
 
   // Header: "# <tv name>"            [STATE]
   snprintf(buf, sizeof(buf), "# %s", s_tv_title);
-  draw_text(ctx, buf, f14b, GRect(4, 0, w - 4 - 66, 18), GTextAlignmentLeft, C_BRIGHT);
+  draw_text(ctx, buf, fsb, GRect(PAD, 0, w - PAD - TAG_W, HDR_H), GTextAlignmentLeft, C_BRIGHT);
   snprintf(buf, sizeof(buf), "[%s]", s_np_state);
-  draw_text(ctx, buf, f14b, GRect(w - 66, 0, 62, 18), GTextAlignmentRight,
+  draw_text(ctx, buf, fsb, GRect(w - TAG_W, 0, TAG_W - PAD, HDR_H), GTextAlignmentRight,
             playing ? C_BRIGHT : (paused ? C_WARN : C_DIM));
 
   // Dashed divider
   graphics_context_set_stroke_color(ctx, C_DIM);
-  for (int x = 4; x < w - 4; x += 4) {
-    graphics_draw_line(ctx, GPoint(x, 20), GPoint(x + 1, 20));
+  for (int x = PAD; x < w - PAD; x += 4) {
+    graphics_draw_line(ctx, GPoint(x, HDR_H + 2), GPoint(x + 1, HDR_H + 2));
   }
 
   // Prompt with blinking cursor
   snprintf(buf, sizeof(buf), "$ now_playing%s", s_cursor_on ? "_" : " ");
-  draw_text(ctx, buf, f14, GRect(4, 22, w - 8, 16), GTextAlignmentLeft, C_DIM);
+  draw_text(ctx, buf, fs, GRect(PAD, PROMPT_Y, w - 2 * PAD, LH_S), GTextAlignmentLeft, C_DIM);
 
   // Title (up to two lines)
   if (s_np_title[0]) {
-    draw_text(ctx, s_np_title, f18b, GRect(4, title_y, w - 8, title_h), GTextAlignmentLeft, C_BRIGHT);
+    draw_text(ctx, s_np_title, fmb, GRect(PAD, title_y, w - 2 * PAD, title_h), GTextAlignmentLeft, C_BRIGHT);
   } else {
-    draw_text(ctx, off ? "[ standby ]" : "-- nothing playing --", f18,
-              GRect(4, title_y, w - 8, title_h), GTextAlignmentLeft, C_DIM);
+    draw_text(ctx, off ? "[ standby ]" : "-- nothing playing --", fm,
+              GRect(PAD, title_y, w - 2 * PAD, title_h), GTextAlignmentLeft, C_DIM);
   }
 
   // Subtitle (artist / series) and app
   if (s_np_sub[0]) {
-    draw_text(ctx, s_np_sub, f14, GRect(4, sub_y, w - 8, 16), GTextAlignmentLeft, C_BRIGHT);
+    draw_text(ctx, s_np_sub, fs, GRect(PAD, sub_y, w - 2 * PAD, LH_S), GTextAlignmentLeft, C_BRIGHT);
   }
   if (s_np_app[0]) {
     snprintf(buf, sizeof(buf), "via %s", s_np_app);
-    draw_text(ctx, buf, f14, GRect(4, app_y, w - 8, 16), GTextAlignmentLeft, C_DIM);
+    draw_text(ctx, buf, fs, GRect(PAD, app_y, w - 2 * PAD, LH_S), GTextAlignmentLeft, C_DIM);
   }
 
-  // Progress bar: [██████    ]
-  int bx = 4;
-  int bw = w - 8;
-  int bh = 8;
+  // Progress bar
+  int bx = PAD;
+  int bw = w - 2 * PAD;
   graphics_context_set_stroke_color(ctx, C_DIM);
-  graphics_draw_rect(ctx, GRect(bx, bar_y, bw, bh));
+  graphics_draw_rect(ctx, GRect(bx, bar_y, bw, BAR_H));
   if (s_np_dur > 0) {
     int32_t pos = s_np_pos > s_np_dur ? s_np_dur : s_np_pos;
     int inner = bw - 4;
     int filled = (int)(((int64_t)inner * pos) / s_np_dur);
     graphics_context_set_fill_color(ctx, C_BRIGHT);
-    for (int x = 0; x < filled; x += 4) {
-      int seg = (filled - x) < 3 ? (filled - x) : 3;
-      graphics_fill_rect(ctx, GRect(bx + 2 + x, bar_y + 2, seg, bh - 4), 0, GCornerNone);
+    for (int x = 0; x < filled; x += SEG_STEP) {
+      int seg = (filled - x) < SEG_W ? (filled - x) : SEG_W;
+      graphics_fill_rect(ctx, GRect(bx + 2 + x, bar_y + 2, seg, BAR_H - 4), 0, GCornerNone);
     }
   }
 
@@ -204,16 +255,19 @@ static void ui_update_proc(Layer *layer, GContext *ctx) {
     snprintf(t1, sizeof(t1), "--:--");
     snprintf(t2, sizeof(t2), "--:--");
   }
-  draw_text(ctx, t1, f14, GRect(4, times_y, w / 2 - 4, 16), GTextAlignmentLeft, C_DIM);
-  draw_text(ctx, t2, f14, GRect(w / 2, times_y, w / 2 - 4, 16), GTextAlignmentRight, C_DIM);
+  draw_text(ctx, t1, fs, GRect(PAD, times_y, w / 2 - PAD, LH_S), GTextAlignmentLeft, C_DIM);
+  draw_text(ctx, t2, fs, GRect(w / 2, times_y, w / 2 - PAD, LH_S), GTextAlignmentRight, C_DIM);
 
-  // Footer: current remote mode
-  draw_text(ctx, s_mode_labels[s_remote_mode], f14, GRect(4, footer_y, w - 8, 16),
-            GTextAlignmentLeft, C_BRIGHT);
+  // Footer: remote mode on the left, clock on the right
+  draw_text(ctx, s_mode_labels[s_remote_mode], fs,
+            GRect(PAD, footer_y, w - 2 * PAD - CLOCK_W, LH_S), GTextAlignmentLeft, C_BRIGHT);
+  char clock[12];
+  fmt_clock(clock, sizeof(clock));
+  draw_text(ctx, clock, fs, GRect(w - PAD - CLOCK_W, footer_y, CLOCK_W, LH_S), GTextAlignmentRight, C_DIM);
 }
 
-// Ticks every second while in use, once a minute when idle. Progress is advanced
-// by the real time elapsed since the last tick, so it stays correct either way.
+// Ticks every second while in use; when idle, once a minute on the minute so the
+// clock stays right. Progress advances by real elapsed time either way.
 static void tick_cb(void *data) {
   time_t now = time(NULL);
   int32_t elapsed = (int32_t)(now - s_last_tick);
@@ -229,7 +283,13 @@ static void tick_cb(void *data) {
   s_cursor_on = active ? !s_cursor_on : true;   // cursor only blinks while in use
   s_tick_idle = !active;
   ui_redraw();
-  s_tick_timer = app_timer_register(active ? 1000 : IDLE_TICK_MS, tick_cb, NULL);
+
+  uint32_t delay = 1000;
+  if (!active) {
+    struct tm *t = localtime(&now);
+    delay = (uint32_t)(60 - t->tm_sec) * 1000 + 50;   // wake right after the minute changes
+  }
+  s_tick_timer = app_timer_register(delay, tick_cb, NULL);
 }
 
 // Call on any button press: wakes the 1-second tick if it was idling
@@ -238,49 +298,120 @@ static void note_activity(void) {
   if (s_tick_idle && s_tick_timer) {
     app_timer_cancel(s_tick_timer);
     s_tick_idle = false;
-    tick_cb(NULL);   // catch up progress now and resume 1 s ticks
+    tick_cb(NULL);   // catch up now and resume 1 s ticks
   }
 }
 
 /* ---------- Terminal-style menus ---------- */
 
-#define MENU_HEADER_H 19
-#define ROW_H_SHORT 27
-#define ROW_H_TALL 40
+/* ---------- Marquee: long text on the selected row slides like a car stereo ---------- */
+
+#define MARQUEE_MS 80          // frame time
+#define MARQUEE_STEP 2         // px per frame (~25 px/s)
+#define MARQUEE_PAUSE 12       // frames to hold at each end (~1 s)
+
+static AppTimer *s_scroll_timer = NULL;
+static int s_scroll_tick = 0;
+static bool s_scroll_active = false;   // set by drawing when something is actually scrolling
+static char s_marquee_key[160] = "";
+
+static void scroll_timer_cb(void *data) {
+  s_scroll_timer = NULL;
+  if (!s_menu_window && !s_tv_window) return;   // no menu open: stop
+  if (s_scroll_active) {
+    s_scroll_tick++;
+    s_scroll_active = false;                    // drawing sets it again if still scrolling
+    if (s_menu_layer) layer_mark_dirty(menu_layer_get_layer(s_menu_layer));
+    if (s_tv_menu_layer) layer_mark_dirty(menu_layer_get_layer(s_tv_menu_layer));
+  }
+  s_scroll_timer = app_timer_register(MARQUEE_MS, scroll_timer_cb, NULL);
+}
+
+static void scroll_timer_start(void) {
+  s_marquee_key[0] = '\0';
+  s_scroll_tick = 0;
+  if (!s_scroll_timer) s_scroll_timer = app_timer_register(MARQUEE_MS, scroll_timer_cb, NULL);
+}
+
+// Draws text in `area`. If it's too wide and `scroll` is true, it slides left to show
+// the rest, holds, then starts over. Otherwise it's drawn normally with an ellipsis.
+static void draw_marquee(GContext *ctx, const char *text, GFont font, GRect area,
+                         int cell_w, GColor color, GColor bg, bool scroll) {
+  GSize sz = graphics_text_layout_get_content_size(text, font, GRect(0, 0, 1000, area.size.h),
+                                                   GTextOverflowModeWordWrap, GTextAlignmentLeft);
+  int overflow = sz.w - area.size.w;
+  if (!scroll || overflow <= 0) {
+    draw_text(ctx, text, font, area, GTextAlignmentLeft, color);
+    return;
+  }
+
+  s_scroll_active = true;
+  int travel = (overflow + MARQUEE_STEP - 1) / MARQUEE_STEP;
+  int cycle = MARQUEE_PAUSE + travel + MARQUEE_PAUSE;
+  int t = s_scroll_tick % cycle;
+  int off = 0;
+  if (t >= MARQUEE_PAUSE + travel) off = overflow;
+  else if (t >= MARQUEE_PAUSE) off = (t - MARQUEE_PAUSE) * MARQUEE_STEP;
+  if (off > overflow) off = overflow;
+
+  graphics_context_set_text_color(ctx, color);
+  graphics_draw_text(ctx, text, font, GRect(area.origin.x - off, area.origin.y, sz.w + 8, area.size.h),
+                     GTextOverflowModeWordWrap, GTextAlignmentLeft, NULL);
+
+  // Hide the parts that slid into the side margins
+  graphics_context_set_fill_color(ctx, bg);
+  graphics_fill_rect(ctx, GRect(0, area.origin.y, area.origin.x, area.size.h), 0, GCornerNone);
+  graphics_fill_rect(ctx, GRect(area.origin.x + area.size.w, area.origin.y,
+                                cell_w - area.origin.x - area.size.w, area.size.h), 0, GCornerNone);
+}
 
 static void draw_menu_header(GContext *ctx, const Layer *cell_layer, const char *left, const char *right) {
   GRect b = layer_get_bounds(cell_layer);
   int w = b.size.w;
-  GFont f14b = fonts_get_system_font(FONT_KEY_GOTHIC_14_BOLD);
+  GFont fsb = fonts_get_system_font(FONT_SB);
   graphics_context_set_fill_color(ctx, GColorBlack);
   graphics_fill_rect(ctx, b, 0, GCornerNone);
-  draw_text(ctx, left, f14b, GRect(4, 0, w - 4 - 66, 18), GTextAlignmentLeft, C_DIM);
-  if (right) draw_text(ctx, right, f14b, GRect(w - 66, 0, 62, 18), GTextAlignmentRight, C_DIM);
+  draw_text(ctx, left, fsb, GRect(PAD, 0, w - PAD - TAG_W, b.size.h - 2), GTextAlignmentLeft, C_DIM);
+  if (right) draw_text(ctx, right, fsb, GRect(w - TAG_W, 0, TAG_W - PAD, b.size.h - 2), GTextAlignmentRight, C_DIM);
   graphics_context_set_stroke_color(ctx, C_DIM);
-  for (int x = 4; x < w - 4; x += 4) {
+  for (int x = PAD; x < w - PAD; x += 4) {
     graphics_draw_line(ctx, GPoint(x, b.size.h - 2), GPoint(x + 1, b.size.h - 2));
   }
 }
 
-// Selected row is drawn inverted (black on green), like a terminal selection bar
-static void draw_menu_row(GContext *ctx, const Layer *cell_layer, const char *title, const char *subtitle) {
+// Selected row is drawn inverted (black on green), like a terminal selection bar.
+static void draw_menu_row(GContext *ctx, const Layer *cell_layer, const char *title,
+                          const char *subtitle) {
   GRect b = layer_get_bounds(cell_layer);
   bool hl = menu_cell_layer_is_highlighted(cell_layer);
   GColor fg = hl ? GColorBlack : C_BRIGHT;
   GColor dim = hl ? GColorBlack : C_DIM;
-  GFont f14 = fonts_get_system_font(FONT_KEY_GOTHIC_14);
-  GFont f18b = fonts_get_system_font(FONT_KEY_GOTHIC_18_BOLD);
+  GFont fs = fonts_get_system_font(FONT_S);
+  GFont ft = fonts_get_system_font(FONT_MB);
 
   graphics_context_set_fill_color(ctx, hl ? C_BRIGHT : GColorBlack);
   graphics_fill_rect(ctx, b, 0, GCornerNone);
 
   char buf[96];
   snprintf(buf, sizeof(buf), "> %s", title);
+
+  // New selected row: restart its scroll from the beginning
+  if (hl) {
+    char key[160];
+    snprintf(key, sizeof(key), "%s|%s", title, subtitle ? subtitle : "");
+    if (strcmp(key, s_marquee_key) != 0) {
+      snprintf(s_marquee_key, sizeof(s_marquee_key), "%s", key);
+      s_scroll_tick = 0;
+    }
+  }
+
+  GColor bg = hl ? C_BRIGHT : GColorBlack;
+  int w = b.size.w;
   if (subtitle && subtitle[0]) {
-    draw_text(ctx, buf, f18b, GRect(4, 1, b.size.w - 8, 22), GTextAlignmentLeft, fg);
-    draw_text(ctx, subtitle, f14, GRect(4, 23, b.size.w - 8, 16), GTextAlignmentLeft, dim);
+    draw_marquee(ctx, buf, ft, GRect(PAD, 1, w - 2 * PAD, LH_M), w, fg, bg, hl);
+    draw_marquee(ctx, subtitle, fs, GRect(PAD, 1 + LH_M, w - 2 * PAD, LH_S), w, dim, bg, hl);
   } else {
-    draw_text(ctx, buf, f18b, GRect(4, (b.size.h - 22) / 2 - 2, b.size.w - 8, 22), GTextAlignmentLeft, fg);
+    draw_marquee(ctx, buf, ft, GRect(PAD, (b.size.h - LH_M) / 2 - 2, w - 2 * PAD, LH_M), w, fg, bg, hl);
   }
 }
 
@@ -289,10 +420,26 @@ static void style_menu_layer(MenuLayer *layer) {
   menu_layer_set_highlight_colors(layer, C_BRIGHT, GColorBlack);
 }
 
+// Up on the first row jumps to the last; Down on the last row jumps to the first
+static void menu_wrap_move(MenuLayer *layer, bool up, uint16_t rows) {
+  MenuIndex idx = menu_layer_get_selected_index(layer);
+  if (up && idx.row == 0) {
+    menu_layer_set_selected_index(layer, MenuIndex(0, rows - 1), MenuRowAlignCenter, true);
+  } else if (!up && idx.row >= rows - 1) {
+    menu_layer_set_selected_index(layer, MenuIndex(0, 0), MenuRowAlignCenter, true);
+  } else {
+    menu_layer_set_selected_next(layer, up, MenuRowAlignCenter, true);
+  }
+}
+
 /* ---------- TV list (nested under "select tv") ---------- */
 
-static uint16_t tv_get_num_rows(MenuLayer *menu_layer, uint16_t section_index, void *context) {
+static uint16_t tv_row_count(void) {
   return s_tv_count == 0 ? 1 : s_tv_count;
+}
+
+static uint16_t tv_get_num_rows(MenuLayer *menu_layer, uint16_t section_index, void *context) {
+  return tv_row_count();
 }
 
 static int16_t tv_get_header_height(MenuLayer *menu_layer, uint16_t section_index, void *context) {
@@ -335,6 +482,28 @@ static void tv_select(MenuLayer *menu_layer, MenuIndex *cell_index, void *contex
   window_stack_remove(s_tv_window, true);
 }
 
+static void tv_up_click(ClickRecognizerRef recognizer, void *context) {
+  note_activity();
+  menu_wrap_move((MenuLayer *)context, true, tv_row_count());
+}
+
+static void tv_down_click(ClickRecognizerRef recognizer, void *context) {
+  note_activity();
+  menu_wrap_move((MenuLayer *)context, false, tv_row_count());
+}
+
+static void tv_select_click(ClickRecognizerRef recognizer, void *context) {
+  MenuLayer *layer = (MenuLayer *)context;
+  MenuIndex idx = menu_layer_get_selected_index(layer);
+  tv_select(layer, &idx, NULL);
+}
+
+static void tv_click_config(void *context) {
+  window_single_repeating_click_subscribe(BUTTON_ID_UP, 120, tv_up_click);
+  window_single_repeating_click_subscribe(BUTTON_ID_DOWN, 120, tv_down_click);
+  window_single_click_subscribe(BUTTON_ID_SELECT, tv_select_click);
+}
+
 static void tv_window_load(Window *window) {
   Layer *window_layer = window_get_root_layer(window);
   s_tv_menu_layer = menu_layer_create(layer_get_bounds(window_layer));
@@ -345,9 +514,9 @@ static void tv_window_load(Window *window) {
     .draw_header = tv_draw_header,
     .get_cell_height = tv_get_cell_height,
     .draw_row = tv_draw_row,
-    .select_click = tv_select,
   });
-  menu_layer_set_click_config_onto_window(s_tv_menu_layer, window);
+  // Own click handling (instead of the menu's default) so the list wraps around
+  window_set_click_config_provider_with_context(window, tv_click_config, s_tv_menu_layer);
   layer_add_child(window_layer, menu_layer_get_layer(s_tv_menu_layer));
   if (s_active_tv_index >= 0 && s_active_tv_index < s_tv_count) {
     menu_layer_set_selected_index(s_tv_menu_layer, MenuIndex(0, s_active_tv_index), MenuRowAlignCenter, false);
@@ -370,9 +539,10 @@ static void open_tv_list(void) {
     .unload = tv_window_unload
   });
   window_stack_push(s_tv_window, true);
+  scroll_timer_start();
 }
 
-/* ---------- Main menu: select tv, power, home, home (hold) ---------- */
+/* ---------- Main menu: select tv, power on/off, home, home (hold) ---------- */
 
 static uint16_t menu_get_num_rows(MenuLayer *menu_layer, uint16_t section_index, void *context) {
   return MENU_ROWS;
@@ -418,6 +588,28 @@ static void menu_select(MenuLayer *menu_layer, MenuIndex *cell_index, void *cont
   window_stack_remove(s_menu_window, true);
 }
 
+static void menu_up_click(ClickRecognizerRef recognizer, void *context) {
+  note_activity();
+  menu_wrap_move((MenuLayer *)context, true, MENU_ROWS);
+}
+
+static void menu_down_click(ClickRecognizerRef recognizer, void *context) {
+  note_activity();
+  menu_wrap_move((MenuLayer *)context, false, MENU_ROWS);
+}
+
+static void menu_select_click(ClickRecognizerRef recognizer, void *context) {
+  MenuLayer *layer = (MenuLayer *)context;
+  MenuIndex idx = menu_layer_get_selected_index(layer);
+  menu_select(layer, &idx, NULL);
+}
+
+static void menu_click_config(void *context) {
+  window_single_repeating_click_subscribe(BUTTON_ID_UP, 120, menu_up_click);
+  window_single_repeating_click_subscribe(BUTTON_ID_DOWN, 120, menu_down_click);
+  window_single_click_subscribe(BUTTON_ID_SELECT, menu_select_click);
+}
+
 static void menu_window_load(Window *window) {
   Layer *window_layer = window_get_root_layer(window);
   s_menu_layer = menu_layer_create(layer_get_bounds(window_layer));
@@ -428,9 +620,8 @@ static void menu_window_load(Window *window) {
     .draw_header = menu_draw_header,
     .get_cell_height = menu_get_cell_height,
     .draw_row = menu_draw_row,
-    .select_click = menu_select,
   });
-  menu_layer_set_click_config_onto_window(s_menu_layer, window);
+  window_set_click_config_provider_with_context(window, menu_click_config, s_menu_layer);
   layer_add_child(window_layer, menu_layer_get_layer(s_menu_layer));
 }
 
@@ -450,6 +641,7 @@ static void open_tv_menu() {
     .unload = menu_window_unload
   });
   window_stack_push(s_menu_window, true);
+  scroll_timer_start();
 }
 
 /* ---------- Back button: tap = menu, double-tap = exit ---------- */
