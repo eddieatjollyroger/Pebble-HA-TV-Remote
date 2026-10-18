@@ -56,14 +56,34 @@ static MenuLayer *s_tv_menu_layer;
 
 // Persistent storage key for the selected TV's display name
 #define PERSIST_KEY_TV_NAME 200
+#define PERSIST_KEY_THEME 201
 
 // Double-tap Back within this window (ms) to exit
 #define DOUBLE_TAP_MS 250
 
 // Terminal palette
-#define C_BRIGHT GColorGreen
-#define C_DIM    GColorIslamicGreen
-#define C_WARN   GColorYellow
+// Dark: green on black. Light: black on white. Same layout, switched from the settings page.
+static GColor s_col_bg, s_col_fg, s_col_dim, s_col_warn;
+static bool s_light_theme = false;
+#define C_BG     s_col_bg
+#define C_BRIGHT s_col_fg
+#define C_DIM    s_col_dim
+#define C_WARN   s_col_warn
+
+static void set_theme_colors(bool light) {
+  s_light_theme = light;
+  if (light) {
+    s_col_bg = GColorWhite;
+    s_col_fg = GColorBlack;
+    s_col_dim = GColorDarkGray;
+    s_col_warn = GColorOrange;
+  } else {
+    s_col_bg = GColorBlack;
+    s_col_fg = GColorGreen;
+    s_col_dim = GColorIslamicGreen;
+    s_col_warn = GColorYellow;
+  }
+}
 
 static char s_tv_names[MAX_TVS][MAX_NAME_LEN];
 static char s_tv_entities[MAX_TVS][MAX_NAME_LEN];
@@ -104,7 +124,8 @@ enum {
   KEY_NP_SUB = 8,
   KEY_NP_APP = 9,
   KEY_NP_POS = 10,
-  KEY_NP_DUR = 11
+  KEY_NP_DUR = 11,
+  KEY_THEME = 12
 };
 
 // Main menu rows: 0 = select tv, 1 = power on, 2 = power off, 3 = home, 4 = home (hold)
@@ -130,6 +151,14 @@ static void send_command(const char *command_str) {
     return;
   }
   dict_write_cstring(iter, KEY_COMMAND, command_str);
+  app_message_outbox_send();
+}
+
+// Ask the phone for the TV list (it answers from its cache, so this is quick)
+static void request_tv_list(void) {
+  DictionaryIterator *iter;
+  if (app_message_outbox_begin(&iter) != APP_MSG_OK || !iter) return;
+  dict_write_int8(iter, KEY_FETCH_TVS, 1);
   app_message_outbox_send();
 }
 
@@ -369,7 +398,7 @@ static void draw_menu_header(GContext *ctx, const Layer *cell_layer, const char 
   GRect b = layer_get_bounds(cell_layer);
   int w = b.size.w;
   GFont fsb = fonts_get_system_font(FONT_SB);
-  graphics_context_set_fill_color(ctx, GColorBlack);
+  graphics_context_set_fill_color(ctx, C_BG);
   graphics_fill_rect(ctx, b, 0, GCornerNone);
   draw_text(ctx, left, fsb, GRect(PAD, 0, w - PAD - TAG_W, b.size.h - 2), GTextAlignmentLeft, C_DIM);
   if (right) draw_text(ctx, right, fsb, GRect(w - TAG_W, 0, TAG_W - PAD, b.size.h - 2), GTextAlignmentRight, C_DIM);
@@ -384,12 +413,12 @@ static void draw_menu_row(GContext *ctx, const Layer *cell_layer, const char *ti
                           const char *subtitle) {
   GRect b = layer_get_bounds(cell_layer);
   bool hl = menu_cell_layer_is_highlighted(cell_layer);
-  GColor fg = hl ? GColorBlack : C_BRIGHT;
-  GColor dim = hl ? GColorBlack : C_DIM;
+  GColor fg = hl ? C_BG : C_BRIGHT;
+  GColor dim = hl ? C_BG : C_DIM;
   GFont fs = fonts_get_system_font(FONT_S);
   GFont ft = fonts_get_system_font(FONT_MB);
 
-  graphics_context_set_fill_color(ctx, hl ? C_BRIGHT : GColorBlack);
+  graphics_context_set_fill_color(ctx, hl ? C_BRIGHT : C_BG);
   graphics_fill_rect(ctx, b, 0, GCornerNone);
 
   char buf[96];
@@ -405,7 +434,7 @@ static void draw_menu_row(GContext *ctx, const Layer *cell_layer, const char *ti
     }
   }
 
-  GColor bg = hl ? C_BRIGHT : GColorBlack;
+  GColor bg = hl ? C_BRIGHT : C_BG;
   int w = b.size.w;
   if (subtitle && subtitle[0]) {
     draw_marquee(ctx, buf, ft, GRect(PAD, 1, w - 2 * PAD, LH_M), w, fg, bg, hl);
@@ -416,8 +445,8 @@ static void draw_menu_row(GContext *ctx, const Layer *cell_layer, const char *ti
 }
 
 static void style_menu_layer(MenuLayer *layer) {
-  menu_layer_set_normal_colors(layer, GColorBlack, C_BRIGHT);
-  menu_layer_set_highlight_colors(layer, C_BRIGHT, GColorBlack);
+  menu_layer_set_normal_colors(layer, C_BG, C_BRIGHT);
+  menu_layer_set_highlight_colors(layer, C_BRIGHT, C_BG);
 }
 
 // Up on the first row jumps to the last; Down on the last row jumps to the first
@@ -430,6 +459,18 @@ static void menu_wrap_move(MenuLayer *layer, bool up, uint16_t rows) {
   } else {
     menu_layer_set_selected_next(layer, up, MenuRowAlignCenter, true);
   }
+}
+
+// Switch palette live: recolor the windows and redraw everything
+static void apply_theme(bool light, bool save) {
+  set_theme_colors(light);
+  if (save) persist_write_bool(PERSIST_KEY_THEME, light);
+  if (s_main_window) window_set_background_color(s_main_window, C_BG);
+  if (s_menu_window) window_set_background_color(s_menu_window, C_BG);
+  if (s_tv_window) window_set_background_color(s_tv_window, C_BG);
+  if (s_menu_layer) { style_menu_layer(s_menu_layer); menu_layer_reload_data(s_menu_layer); }
+  if (s_tv_menu_layer) { style_menu_layer(s_tv_menu_layer); menu_layer_reload_data(s_tv_menu_layer); }
+  ui_redraw();
 }
 
 /* ---------- TV list (nested under "select tv") ---------- */
@@ -533,13 +574,14 @@ static void tv_window_unload(Window *window) {
 static void open_tv_list(void) {
   if (s_tv_window) return;
   s_tv_window = window_create();
-  window_set_background_color(s_tv_window, GColorBlack);
+  window_set_background_color(s_tv_window, C_BG);
   window_set_window_handlers(s_tv_window, (WindowHandlers) {
     .load = tv_window_load,
     .unload = tv_window_unload
   });
   window_stack_push(s_tv_window, true);
   scroll_timer_start();
+  request_tv_list();
 }
 
 /* ---------- Main menu: select tv, power on/off, home, home (hold) ---------- */
@@ -635,7 +677,7 @@ static void menu_window_unload(Window *window) {
 static void open_tv_menu() {
   if (s_menu_window) return;
   s_menu_window = window_create();
-  window_set_background_color(s_menu_window, GColorBlack);
+  window_set_background_color(s_menu_window, C_BG);
   window_set_window_handlers(s_menu_window, (WindowHandlers) {
     .load = menu_window_load,
     .unload = menu_window_unload
@@ -711,6 +753,14 @@ static void click_config_provider(void *context) {
 /* ---------- Messages from the phone ---------- */
 
 static void in_received_handler(DictionaryIterator *iter, void *context) {
+  // Theme chosen on the settings page (0 = dark, 1 = light)
+  Tuple *theme_tuple = dict_find(iter, KEY_THEME);
+  if (theme_tuple) {
+    bool light = theme_tuple->value->int32 != 0;
+    if (light != s_light_theme) apply_theme(light, true);
+    return;
+  }
+
   // Now-playing update
   Tuple *np_state = dict_find(iter, KEY_NP_STATE);
   if (np_state) {
@@ -796,8 +846,9 @@ static void main_window_unload(Window *window) {
 }
 
 static void init() {
+  set_theme_colors(persist_exists(PERSIST_KEY_THEME) ? persist_read_bool(PERSIST_KEY_THEME) : false);
   s_main_window = window_create();
-  window_set_background_color(s_main_window, GColorBlack);
+  window_set_background_color(s_main_window, C_BG);
   window_set_click_config_provider(s_main_window, click_config_provider);
   window_set_window_handlers(s_main_window, (WindowHandlers) {
     .load = main_window_load,
