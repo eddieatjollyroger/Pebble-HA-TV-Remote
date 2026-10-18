@@ -90,7 +90,7 @@ Pebble.addEventListener('showConfiguration', function(e) {
   Pebble.openURL('https://eddieatjollyroger.github.io/Pebble-HA-TV-Remote' + encodeURIComponent(currentUrl) + '&token=' + encodeURIComponent(currentToken) + '&return_to=' + encodeURIComponent(returnUrl));
 });
 
-Pebble.addEventListener('webkitclosedconfiguration', function(e) {
+Pebble.addEventListener('webviewclosed', function(e) {
   if (e.response) {
     try {
       var configData = JSON.parse(decodeURIComponent(e.response));
