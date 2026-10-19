@@ -202,6 +202,12 @@ function pollNowPlaying() {
     var title = a.media_title || '';
     var sub = a.media_artist || a.media_series_title || a.media_album_name || '';
     var app = a.app_name || '';
+    // Android TV and VIDAA players don't report titles or progress. Show the app (or the
+    // input) as the main line instead, so there's still something useful on screen.
+    if (!title) {
+      if (app) { title = app; app = ''; }
+      else if (a.source) { title = a.source; }
+    }
 
     var dur = Math.round(a.media_duration || 0);
     var pos = Math.round(a.media_position || 0);
@@ -261,8 +267,9 @@ function fetchRemotesFromStates(done) {
       var id = it.entity_id;
       if (id.indexOf('button.') !== 0 || id.indexOf('vidaa') === -1 || !/_ok$/.test(id)) return;
       var base = id.slice(7).replace(/_ok$/, '');
-      var dup = remotes.some(function(r) { return r.id.slice(7) === base; });
-      if (!dup) remotes.push({ id: 'button.' + base, name: String(it.attributes.friendly_name || base).replace(/\s+ok$/i, '') });
+      // The integration's own remote entity (e.g. remote.<base>_remote) is a dead duplicate
+      remotes = remotes.filter(function(r) { return r.id.slice(7).indexOf(base) !== 0; });
+      remotes.push({ id: 'button.' + base, name: String(it.attributes.friendly_name || base).replace(/\s+ok$/i, '') });
     });
     done(remotes, buildMediaMap(states, remotes));
   };
@@ -285,11 +292,11 @@ function fetchRemotes(done) {
            "{% endfor %}{% endif %}";
   }
   var tpl =
-    "{% for r in states.remote %}{{ r.entity_id }}\t{{ r.name }}\t" + mpFor("r.entity_id", "d") + "\n{% endfor %}" +
+    "{% for r in states.remote %}{{ r.entity_id }}\t{{ r.name }}\t" + mpFor("r.entity_id", "d") + "\t{{ d }}\n{% endfor %}" +
     "{% for b in states.button if 'vidaa' in b.entity_id and b.entity_id.endswith('_ok') %}" +
     "{{ b.entity_id }}\t{% set bd = device_id(b.entity_id) %}" +
     "{{ (device_attr(bd, 'name_by_user') or device_attr(bd, 'name')) if bd else b.name }}\t" +
-    mpFor("b.entity_id", "bd2") + "\n{% endfor %}";
+    mpFor("b.entity_id", "bd2") + "\t{{ bd2 }}\n{% endfor %}";
 
   var xhr = new XMLHttpRequest();
   xhr.open('POST', haUrl + '/api/template', true);
@@ -297,20 +304,28 @@ function fetchRemotes(done) {
   xhr.setRequestHeader("Content-Type", "application/json");
   xhr.onload = function() {
     if (xhr.status === 200) {
-      var remotes = [], map = {}, buttons = [];
+      var remotes = [], map = {}, buttons = [], devOf = {};
       xhr.responseText.split('\n').forEach(function(line) {
         var p = line.split('\t');
         var id = trim(p[0]);
         var name = trim(p[1]);
         var mp = trim(p[2]).split(' ')[0];
+        var dev = trim(p[3]);
+        if (dev === 'None') dev = '';
         if (id.indexOf('remote.') === 0) {
           remotes.push({ id: id, name: name || id });
           if (mp) map[id] = mp;
+          if (dev) devOf[id] = dev;
         } else if (id.indexOf('button.') === 0) {
           var base = id.slice(7).replace(/_ok$/, '');
-          buttons.push({ id: 'button.' + base, name: name || base, mp: mp });
+          buttons.push({ id: 'button.' + base, name: name || base, mp: mp, dev: dev });
         }
       });
+      // A VIDAA TV is listed through its buttons, so drop the integration's own "remote"
+      // entity for that same device (it would show up as a second, dead entry)
+      var buttonDevs = {};
+      buttons.forEach(function(bt) { if (bt.dev) buttonDevs[bt.dev] = true; });
+      remotes = remotes.filter(function(r) { return !(devOf[r.id] && buttonDevs[devOf[r.id]]); });
       // A VIDAA TV that also has a remote entity is already listed once; don't add it twice
       buttons.forEach(function(bt) {
         var dup = remotes.some(function(r) { return r.id.slice(7) === bt.id.slice(7); });
