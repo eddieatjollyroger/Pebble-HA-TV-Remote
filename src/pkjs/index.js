@@ -17,6 +17,26 @@ function themeValue() {
 var ACTIVE_MS = 30000;
 var lastActivity = Date.now();
 
+// VIDAA TVs are driven through Home Assistant button entities, named
+// button.<device>_<key>, exactly like your universal remote script. A TV counts as VIDAA
+// when "vidaa" appears in its entity name.
+function isVidaa(entityId) {
+  return entityId.split('.').pop().indexOf('vidaa') !== -1;
+}
+
+// Watch command -> the key part of the button entity name.
+// up/down/left/right/ok/stop/home come from your script (Back = stop, like there).
+// volume_* and power are my best guess: check the button entities your VIDAA TV
+// actually has in Home Assistant and edit these names if they differ.
+var VIDAA_KEYS = {
+  'up': 'up', 'down': 'down', 'left': 'left', 'right': 'right',
+  'select': 'ok',
+  'menu': 'stop',
+  'home': 'home', 'home_hold': 'home',
+  'volume_up': 'volume_up', 'volume_down': 'volume_down',
+  'power_on': 'power', 'power_off': 'power'
+};
+
 function getDeviceCommand(entityId, cmd) {
   var isAndroid = entityId.indexOf("android") !== -1 ||
                   entityId.indexOf("shield") !== -1 ||
@@ -37,14 +57,14 @@ function getDeviceCommand(entityId, cmd) {
   return androidMap[cmd] || cmd;
 }
 
-function callService(service, payload) {
+function callService(domain, service, payload) {
   var haUrl = localStorage.getItem('ha_url');
   var haToken = localStorage.getItem('ha_token');
   if (!haUrl || !haToken || !activeEntityId) return;
   if (haUrl.charAt(haUrl.length - 1) === '/') haUrl = haUrl.slice(0, -1);
 
   var xhr = new XMLHttpRequest();
-  xhr.open('POST', haUrl + "/api/services/remote/" + service, true);
+  xhr.open('POST', haUrl + "/api/services/" + domain + "/" + service, true);
   xhr.setRequestHeader("Authorization", "Bearer " + haToken);
   xhr.setRequestHeader("Content-Type", "application/json");
   xhr.onreadystatechange = function () {
@@ -56,10 +76,18 @@ function callService(service, payload) {
 }
 
 function sendCommandToHA(commandName) {
-  callService('send_command', {
-    "entity_id": activeEntityId,
-    "command": [getDeviceCommand(activeEntityId, commandName)]
-  });
+  if (isVidaa(activeEntityId)) {
+    var key = VIDAA_KEYS[commandName];
+    if (key) {
+      var base = activeEntityId.split('.').pop();
+      callService('button', 'press', { "entity_id": "button." + base + "_" + key });
+    }
+  } else {
+    callService('remote', 'send_command', {
+      "entity_id": activeEntityId,
+      "command": [getDeviceCommand(activeEntityId, commandName)]
+    });
+  }
   // Refresh now-playing shortly after a command (pause, power, etc.)
   setTimeout(pollNowPlaying, 1500);
 }
@@ -228,6 +256,14 @@ function fetchRemotesFromStates(done) {
     var states = JSON.parse(xhr.responseText);
     var remotes = states.filter(function(it) { return it.entity_id.indexOf('remote.') === 0; })
       .map(function(it) { return { id: it.entity_id, name: it.attributes.friendly_name || it.entity_id }; });
+    // VIDAA TVs: found through their "..._ok" button, unless they also have a remote entity
+    states.forEach(function(it) {
+      var id = it.entity_id;
+      if (id.indexOf('button.') !== 0 || id.indexOf('vidaa') === -1 || !/_ok$/.test(id)) return;
+      var base = id.slice(7).replace(/_ok$/, '');
+      var dup = remotes.some(function(r) { return r.id.slice(7) === base; });
+      if (!dup) remotes.push({ id: 'button.' + base, name: String(it.attributes.friendly_name || base).replace(/\s+ok$/i, '') });
+    });
     done(remotes, buildMediaMap(states, remotes));
   };
   xhr.onerror = function() { done(null); };
@@ -242,9 +278,18 @@ function fetchRemotes(done) {
   if (!haUrl || !haToken) { done(null); return; }
   if (haUrl.charAt(haUrl.length - 1) === '/') haUrl = haUrl.slice(0, -1);
 
-  var tpl = "{% for r in states.remote %}{{ r.entity_id }}\t{{ r.name }}\t" +
-            "{% set d = device_id(r.entity_id) %}{% if d %}{% for e in device_entities(d) %}" +
-            "{% if e.startswith('media_player.') %}{{ e }} {% endif %}{% endfor %}{% endif %}\n{% endfor %}";
+  // The media_player on the same device as an entity (space separated if several)
+  function mpFor(ent, v) {
+    return "{% set " + v + " = device_id(" + ent + ") %}{% if " + v + " %}" +
+           "{% for e in device_entities(" + v + ") %}{% if e.startswith('media_player.') %}{{ e }} {% endif %}" +
+           "{% endfor %}{% endif %}";
+  }
+  var tpl =
+    "{% for r in states.remote %}{{ r.entity_id }}\t{{ r.name }}\t" + mpFor("r.entity_id", "d") + "\n{% endfor %}" +
+    "{% for b in states.button if 'vidaa' in b.entity_id and b.entity_id.endswith('_ok') %}" +
+    "{{ b.entity_id }}\t{% set bd = device_id(b.entity_id) %}" +
+    "{{ (device_attr(bd, 'name_by_user') or device_attr(bd, 'name')) if bd else b.name }}\t" +
+    mpFor("b.entity_id", "bd2") + "\n{% endfor %}";
 
   var xhr = new XMLHttpRequest();
   xhr.open('POST', haUrl + '/api/template', true);
@@ -252,14 +297,27 @@ function fetchRemotes(done) {
   xhr.setRequestHeader("Content-Type", "application/json");
   xhr.onload = function() {
     if (xhr.status === 200) {
-      var remotes = [], map = {};
+      var remotes = [], map = {}, buttons = [];
       xhr.responseText.split('\n').forEach(function(line) {
         var p = line.split('\t');
         var id = trim(p[0]);
-        if (id.indexOf('remote.') !== 0) return;
-        remotes.push({ id: id, name: trim(p[1]) || id });
+        var name = trim(p[1]);
         var mp = trim(p[2]).split(' ')[0];
-        if (mp) map[id] = mp;
+        if (id.indexOf('remote.') === 0) {
+          remotes.push({ id: id, name: name || id });
+          if (mp) map[id] = mp;
+        } else if (id.indexOf('button.') === 0) {
+          var base = id.slice(7).replace(/_ok$/, '');
+          buttons.push({ id: 'button.' + base, name: name || base, mp: mp });
+        }
+      });
+      // A VIDAA TV that also has a remote entity is already listed once; don't add it twice
+      buttons.forEach(function(bt) {
+        var dup = remotes.some(function(r) { return r.id.slice(7) === bt.id.slice(7); });
+        if (!dup) {
+          remotes.push({ id: bt.id, name: bt.name });
+          if (bt.mp) map[bt.id] = bt.mp;
+        }
       });
       if (remotes.length) { done(remotes, map); return; }
     }
