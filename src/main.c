@@ -211,6 +211,92 @@ static void draw_text(GContext *ctx, const char *text, GFont font, GRect rect,
   graphics_draw_text(ctx, text, font, rect, GTextOverflowModeTrailingEllipsis, align, NULL);
 }
 
+/* ---------- Marquee: long text slides like a car stereo ---------- */
+
+#define MARQUEE_MS 80          // frame time while something is scrolling
+#define MARQUEE_STEP 2         // px per frame (~25 px/s)
+#define MARQUEE_PAUSE 12       // frames to hold at each end (~1 s)
+
+static AppTimer *s_scroll_timer = NULL;
+static int s_scroll_tick = 0;           // the selected menu row
+static bool s_scroll_active = false;    // set by drawing when it's actually scrolling
+static char s_marquee_key[160] = "";
+static int s_header_tick = 0;           // the main screen's TV name
+static bool s_header_active = false;
+static char s_header_key[MAX_NAME_LEN] = "";
+
+// The timer only runs while something might scroll: a menu is open, or the remote was used recently
+static bool scroll_wanted(void) {
+  if (s_menu_window || s_tv_window) return true;
+  return (time(NULL) - s_last_activity) < ACTIVE_SECS;
+}
+
+static void scroll_timer_cb(void *data) {
+  s_scroll_timer = NULL;
+  if (!scroll_wanted()) return;                 // stops; restarted by the next button press
+  bool any = s_scroll_active || s_header_active;
+  if (s_scroll_active) {
+    s_scroll_tick++;
+    s_scroll_active = false;                    // drawing sets it again if still scrolling
+    if (s_menu_layer) layer_mark_dirty(menu_layer_get_layer(s_menu_layer));
+    if (s_tv_menu_layer) layer_mark_dirty(menu_layer_get_layer(s_tv_menu_layer));
+  }
+  if (s_header_active) {
+    s_header_tick++;
+    s_header_active = false;
+    ui_redraw();
+  }
+  s_scroll_timer = app_timer_register(any ? MARQUEE_MS : 300, scroll_timer_cb, NULL);
+}
+
+static void scroll_timer_ensure(void) {
+  if (!s_scroll_timer) s_scroll_timer = app_timer_register(MARQUEE_MS, scroll_timer_cb, NULL);
+}
+
+// A menu just opened: start its scroll from the beginning
+static void scroll_timer_start(void) {
+  s_marquee_key[0] = '\0';
+  s_scroll_tick = 0;
+  scroll_timer_ensure();
+}
+
+// Draws text in `area`. If it's too wide and `scroll` is true, it slides left to show
+// the rest, holds, then starts over. Otherwise it's drawn normally with an ellipsis.
+static void draw_marquee(GContext *ctx, const char *text, GFont font, GRect area, int cell_w,
+                         GColor color, GColor bg, bool scroll, int tick, bool *active) {
+  GSize sz = graphics_text_layout_get_content_size(text, font, GRect(0, 0, 1000, area.size.h),
+                                                   GTextOverflowModeWordWrap, GTextAlignmentLeft);
+  int overflow = sz.w - area.size.w;
+  if (!scroll || overflow <= 0) {
+    draw_text(ctx, text, font, area, GTextAlignmentLeft, color);
+    return;
+  }
+
+  *active = true;
+  int travel = (overflow + MARQUEE_STEP - 1) / MARQUEE_STEP;
+  int cycle = MARQUEE_PAUSE + travel + MARQUEE_PAUSE;
+  int t = tick % cycle;
+  int off = 0;
+  if (t >= MARQUEE_PAUSE + travel) off = overflow;
+  else if (t >= MARQUEE_PAUSE) off = (t - MARQUEE_PAUSE) * MARQUEE_STEP;
+  if (off > overflow) off = overflow;
+
+  graphics_context_set_text_color(ctx, color);
+  graphics_draw_text(ctx, text, font, GRect(area.origin.x - off, area.origin.y, sz.w + 8, area.size.h),
+                     GTextOverflowModeWordWrap, GTextAlignmentLeft, NULL);
+
+  // Hide the parts that slid into the side margins
+  graphics_context_set_fill_color(ctx, bg);
+  graphics_fill_rect(ctx, GRect(0, area.origin.y, area.origin.x, area.size.h), 0, GCornerNone);
+  graphics_fill_rect(ctx, GRect(area.origin.x + area.size.w, area.origin.y,
+                                cell_w - area.origin.x - area.size.w, area.size.h), 0, GCornerNone);
+}
+
+static int text_width(const char *text, GFont font) {
+  return graphics_text_layout_get_content_size(text, font, GRect(0, 0, 1000, 40),
+                                               GTextOverflowModeWordWrap, GTextAlignmentLeft).w;
+}
+
 static void ui_update_proc(Layer *layer, GContext *ctx) {
   GRect b = layer_get_bounds(layer);
   int w = b.size.w;
@@ -242,10 +328,19 @@ static void ui_update_proc(Layer *layer, GContext *ctx) {
   char buf[80];
 
   // Header: "# <tv name>"            [STATE]
+  char tag[16];
+  snprintf(tag, sizeof(tag), "[%s]", s_np_state);
+  int tag_w = text_width(tag, fsb) + 2;
   snprintf(buf, sizeof(buf), "# %s", s_tv_title);
-  draw_text(ctx, buf, fsb, GRect(PAD, 0, w - PAD - TAG_W, HDR_H), GTextAlignmentLeft, C_BRIGHT);
-  snprintf(buf, sizeof(buf), "[%s]", s_np_state);
-  draw_text(ctx, buf, fsb, GRect(w - TAG_W, 0, TAG_W - PAD, HDR_H), GTextAlignmentRight,
+  // Slide a long name only while the remote is in use; otherwise show it cut off with "..."
+  bool hscroll = (time(NULL) - s_last_activity) < ACTIVE_SECS;
+  if (!hscroll || strcmp(s_header_key, s_tv_title) != 0) {
+    snprintf(s_header_key, sizeof(s_header_key), "%s", s_tv_title);
+    s_header_tick = 0;                          // always start from the beginning
+  }
+  draw_marquee(ctx, buf, fsb, GRect(PAD, 0, w - 3 * PAD - tag_w, HDR_H), w, C_BRIGHT, C_BG,
+               hscroll, s_header_tick, &s_header_active);
+  draw_text(ctx, tag, fsb, GRect(w - PAD - tag_w, 0, tag_w, HDR_H), GTextAlignmentRight,
             playing ? C_BRIGHT : (paused ? C_WARN : C_DIM));
 
   // Dashed divider
@@ -275,12 +370,13 @@ static void ui_update_proc(Layer *layer, GContext *ctx) {
     draw_text(ctx, buf, fs, GRect(PAD, app_y, w - 2 * PAD, LH_S), GTextAlignmentLeft, C_DIM);
   }
 
-  // Progress bar
-  int bx = PAD;
-  int bw = w - 2 * PAD;
-  graphics_context_set_stroke_color(ctx, C_DIM);
-  graphics_draw_rect(ctx, GRect(bx, bar_y, bw, BAR_H));
+  // Progress bar and times, only for players that report a duration (e.g. Apple TV)
   if (s_np_dur > 0) {
+    int bx = PAD;
+    int bw = w - 2 * PAD;
+    graphics_context_set_stroke_color(ctx, C_DIM);
+    graphics_draw_rect(ctx, GRect(bx, bar_y, bw, BAR_H));
+
     int32_t pos = s_np_pos > s_np_dur ? s_np_dur : s_np_pos;
     int inner = bw - 4;
     int filled = (int)(((int64_t)inner * pos) / s_np_dur);
@@ -289,19 +385,13 @@ static void ui_update_proc(Layer *layer, GContext *ctx) {
       int seg = (filled - x) < SEG_W ? (filled - x) : SEG_W;
       graphics_fill_rect(ctx, GRect(bx + 2 + x, bar_y + 2, seg, BAR_H - 4), 0, GCornerNone);
     }
-  }
 
-  // Elapsed / total
-  char t1[16], t2[16];
-  if (s_np_dur > 0) {
+    char t1[16], t2[16];
     fmt_time(t1, sizeof(t1), s_np_pos);
     fmt_time(t2, sizeof(t2), s_np_dur);
-  } else {
-    snprintf(t1, sizeof(t1), "--:--");
-    snprintf(t2, sizeof(t2), "--:--");
+    draw_text(ctx, t1, fs, GRect(PAD, times_y, w / 2 - PAD, LH_S), GTextAlignmentLeft, C_DIM);
+    draw_text(ctx, t2, fs, GRect(w / 2, times_y, w / 2 - PAD, LH_S), GTextAlignmentRight, C_DIM);
   }
-  draw_text(ctx, t1, fs, GRect(PAD, times_y, w / 2 - PAD, LH_S), GTextAlignmentLeft, C_DIM);
-  draw_text(ctx, t2, fs, GRect(w / 2, times_y, w / 2 - PAD, LH_S), GTextAlignmentRight, C_DIM);
 
   // Footer: remote mode on the left, clock on the right
   draw_text(ctx, s_mode_labels[s_remote_mode], fs,
@@ -340,6 +430,7 @@ static void tick_cb(void *data) {
 // Call on any button press: wakes the 1-second tick if it was idling
 static void note_activity(void) {
   s_last_activity = time(NULL);
+  scroll_timer_ensure();   // a long TV name in the header can slide again
   if (s_tick_idle && s_tick_timer) {
     app_timer_cancel(s_tick_timer);
     s_tick_idle = false;
@@ -349,75 +440,16 @@ static void note_activity(void) {
 
 /* ---------- Terminal-style menus ---------- */
 
-/* ---------- Marquee: long text on the selected row slides like a car stereo ---------- */
-
-#define MARQUEE_MS 80          // frame time
-#define MARQUEE_STEP 2         // px per frame (~25 px/s)
-#define MARQUEE_PAUSE 12       // frames to hold at each end (~1 s)
-
-static AppTimer *s_scroll_timer = NULL;
-static int s_scroll_tick = 0;
-static bool s_scroll_active = false;   // set by drawing when something is actually scrolling
-static char s_marquee_key[160] = "";
-
-static void scroll_timer_cb(void *data) {
-  s_scroll_timer = NULL;
-  if (!s_menu_window && !s_tv_window) return;   // no menu open: stop
-  if (s_scroll_active) {
-    s_scroll_tick++;
-    s_scroll_active = false;                    // drawing sets it again if still scrolling
-    if (s_menu_layer) layer_mark_dirty(menu_layer_get_layer(s_menu_layer));
-    if (s_tv_menu_layer) layer_mark_dirty(menu_layer_get_layer(s_tv_menu_layer));
-  }
-  s_scroll_timer = app_timer_register(MARQUEE_MS, scroll_timer_cb, NULL);
-}
-
-static void scroll_timer_start(void) {
-  s_marquee_key[0] = '\0';
-  s_scroll_tick = 0;
-  if (!s_scroll_timer) s_scroll_timer = app_timer_register(MARQUEE_MS, scroll_timer_cb, NULL);
-}
-
-// Draws text in `area`. If it's too wide and `scroll` is true, it slides left to show
-// the rest, holds, then starts over. Otherwise it's drawn normally with an ellipsis.
-static void draw_marquee(GContext *ctx, const char *text, GFont font, GRect area,
-                         int cell_w, GColor color, GColor bg, bool scroll) {
-  GSize sz = graphics_text_layout_get_content_size(text, font, GRect(0, 0, 1000, area.size.h),
-                                                   GTextOverflowModeWordWrap, GTextAlignmentLeft);
-  int overflow = sz.w - area.size.w;
-  if (!scroll || overflow <= 0) {
-    draw_text(ctx, text, font, area, GTextAlignmentLeft, color);
-    return;
-  }
-
-  s_scroll_active = true;
-  int travel = (overflow + MARQUEE_STEP - 1) / MARQUEE_STEP;
-  int cycle = MARQUEE_PAUSE + travel + MARQUEE_PAUSE;
-  int t = s_scroll_tick % cycle;
-  int off = 0;
-  if (t >= MARQUEE_PAUSE + travel) off = overflow;
-  else if (t >= MARQUEE_PAUSE) off = (t - MARQUEE_PAUSE) * MARQUEE_STEP;
-  if (off > overflow) off = overflow;
-
-  graphics_context_set_text_color(ctx, color);
-  graphics_draw_text(ctx, text, font, GRect(area.origin.x - off, area.origin.y, sz.w + 8, area.size.h),
-                     GTextOverflowModeWordWrap, GTextAlignmentLeft, NULL);
-
-  // Hide the parts that slid into the side margins
-  graphics_context_set_fill_color(ctx, bg);
-  graphics_fill_rect(ctx, GRect(0, area.origin.y, area.origin.x, area.size.h), 0, GCornerNone);
-  graphics_fill_rect(ctx, GRect(area.origin.x + area.size.w, area.origin.y,
-                                cell_w - area.origin.x - area.size.w, area.size.h), 0, GCornerNone);
-}
-
 static void draw_menu_header(GContext *ctx, const Layer *cell_layer, const char *left, const char *right) {
   GRect b = layer_get_bounds(cell_layer);
   int w = b.size.w;
   GFont fsb = fonts_get_system_font(FONT_SB);
   graphics_context_set_fill_color(ctx, C_BG);
   graphics_fill_rect(ctx, b, 0, GCornerNone);
-  draw_text(ctx, left, fsb, GRect(PAD, 0, w - PAD - TAG_W, b.size.h - 2), GTextAlignmentLeft, C_DIM);
-  if (right) draw_text(ctx, right, fsb, GRect(w - TAG_W, 0, TAG_W - PAD, b.size.h - 2), GTextAlignmentRight, C_DIM);
+  int rw = right ? text_width(right, fsb) + 2 : 0;
+  draw_text(ctx, left, fsb, GRect(PAD, 0, w - 2 * PAD - (right ? rw + PAD : 0), b.size.h - 2),
+            GTextAlignmentLeft, C_DIM);
+  if (right) draw_text(ctx, right, fsb, GRect(w - PAD - rw, 0, rw, b.size.h - 2), GTextAlignmentRight, C_DIM);
   graphics_context_set_stroke_color(ctx, C_DIM);
   for (int x = PAD; x < w - PAD; x += 4) {
     graphics_draw_line(ctx, GPoint(x, b.size.h - 2), GPoint(x + 1, b.size.h - 2));
@@ -453,10 +485,10 @@ static void draw_menu_row(GContext *ctx, const Layer *cell_layer, const char *ti
   GColor bg = hl ? C_BRIGHT : C_BG;
   int w = b.size.w;
   if (subtitle && subtitle[0]) {
-    draw_marquee(ctx, buf, ft, GRect(PAD, 1, w - 2 * PAD, LH_M), w, fg, bg, hl);
-    draw_marquee(ctx, subtitle, fs, GRect(PAD, 1 + LH_M, w - 2 * PAD, LH_S), w, dim, bg, hl);
+    draw_marquee(ctx, buf, ft, GRect(PAD, 1, w - 2 * PAD, LH_M), w, fg, bg, hl, s_scroll_tick, &s_scroll_active);
+    draw_marquee(ctx, subtitle, fs, GRect(PAD, 1 + LH_M, w - 2 * PAD, LH_S), w, dim, bg, hl, s_scroll_tick, &s_scroll_active);
   } else {
-    draw_marquee(ctx, buf, ft, GRect(PAD, (b.size.h - LH_M) / 2 - 2, w - 2 * PAD, LH_M), w, fg, bg, hl);
+    draw_marquee(ctx, buf, ft, GRect(PAD, (b.size.h - LH_M) / 2 - 2, w - 2 * PAD, LH_M), w, fg, bg, hl, s_scroll_tick, &s_scroll_active);
   }
 }
 
@@ -849,6 +881,7 @@ static void main_window_load(Window *window) {
 
   s_last_activity = s_last_tick = time(NULL);
   s_tick_idle = false;
+  scroll_timer_ensure();
   s_tick_timer = app_timer_register(1000, tick_cb, NULL);
 }
 
