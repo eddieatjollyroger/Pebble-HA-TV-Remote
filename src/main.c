@@ -2,7 +2,7 @@
 
 /* ---------- Sizing: bigger fonts and spacing on Pebble Time 2 (Emery) ---------- */
 
-#if defined(PBL_PLATFORM_EMERY)
+#if defined(PBL_PLATFORM_EMERY) || defined(PBL_PLATFORM_GABBRO)
   #define FONT_S   FONT_KEY_GOTHIC_18
   #define FONT_SB  FONT_KEY_GOTHIC_18_BOLD
   #define FONT_M   FONT_KEY_GOTHIC_24
@@ -41,6 +41,17 @@
   #define ROW_H_SHORT 27
   #define ROW_H_TALL 40
 #endif
+
+// On round watches the corners of a rectangle are cut off by the bezel. Draw inside the
+// largest square that fits in the circle instead. Rectangular watches use the full screen.
+static GRect safe_bounds(GRect full) {
+#if defined(PBL_ROUND)
+  int side = (full.size.w * 707) / 1000;
+  return GRect((full.size.w - side) / 2, (full.size.h - side) / 2, side, side);
+#else
+  return full;
+#endif
+}
 
 static Window *s_main_window;
 static Layer *s_ui_layer;
@@ -222,6 +233,11 @@ static void ui_update_proc(Layer *layer, GContext *ctx) {
   int sub_y = app_y - LH_S;
   int title_y = PROMPT_Y + LH_S + TITLE_GAP;
   int title_h = sub_y - title_y - 1;
+  bool compact = title_h < LH_M;   // very small screens: give the title the room instead
+  if (compact) {
+    sub_y = app_y = bar_y;
+    title_h = bar_y - title_y - 1;
+  }
 
   char buf[80];
 
@@ -251,10 +267,10 @@ static void ui_update_proc(Layer *layer, GContext *ctx) {
   }
 
   // Subtitle (artist / series) and app
-  if (s_np_sub[0]) {
+  if (!compact && s_np_sub[0]) {
     draw_text(ctx, s_np_sub, fs, GRect(PAD, sub_y, w - 2 * PAD, LH_S), GTextAlignmentLeft, C_BRIGHT);
   }
-  if (s_np_app[0]) {
+  if (!compact && s_np_app[0]) {
     snprintf(buf, sizeof(buf), "via %s", s_np_app);
     draw_text(ctx, buf, fs, GRect(PAD, app_y, w - 2 * PAD, LH_S), GTextAlignmentLeft, C_DIM);
   }
@@ -547,7 +563,7 @@ static void tv_click_config(void *context) {
 
 static void tv_window_load(Window *window) {
   Layer *window_layer = window_get_root_layer(window);
-  s_tv_menu_layer = menu_layer_create(layer_get_bounds(window_layer));
+  s_tv_menu_layer = menu_layer_create(safe_bounds(layer_get_bounds(window_layer)));
   style_menu_layer(s_tv_menu_layer);
   menu_layer_set_callbacks(s_tv_menu_layer, NULL, (MenuLayerCallbacks){
     .get_num_rows = tv_get_num_rows,
@@ -654,7 +670,7 @@ static void menu_click_config(void *context) {
 
 static void menu_window_load(Window *window) {
   Layer *window_layer = window_get_root_layer(window);
-  s_menu_layer = menu_layer_create(layer_get_bounds(window_layer));
+  s_menu_layer = menu_layer_create(safe_bounds(layer_get_bounds(window_layer)));
   style_menu_layer(s_menu_layer);
   menu_layer_set_callbacks(s_menu_layer, NULL, (MenuLayerCallbacks){
     .get_num_rows = menu_get_num_rows,
@@ -827,7 +843,7 @@ static void main_window_load(Window *window) {
     persist_read_string(PERSIST_KEY_TV_NAME, s_tv_title, MAX_NAME_LEN);
   }
 
-  s_ui_layer = layer_create(layer_get_bounds(window_layer));
+  s_ui_layer = layer_create(safe_bounds(layer_get_bounds(window_layer)));
   layer_set_update_proc(s_ui_layer, ui_update_proc);
   layer_add_child(window_layer, s_ui_layer);
 
