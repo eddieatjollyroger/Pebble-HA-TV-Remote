@@ -139,8 +139,8 @@ enum {
   KEY_THEME = 12
 };
 
-// Main menu rows: 0 = select tv, 1 = power on, 2 = power off, 3 = home, 4 = home (hold)
-#define MENU_ROWS 5
+// Main menu rows: 0 = select tv, 1 = power on, 2 = power off, 3 = home, 4 = home (hold), 5 = reload tv
+#define MENU_ROWS 6
 
 static const char *s_mode_labels[] = {
   "> left/right", "> up/down", "> volume"
@@ -658,7 +658,8 @@ static void menu_draw_row(GContext *ctx, const Layer *cell_layer, MenuIndex *cel
     case 1: draw_menu_row(ctx, cell_layer, "power on", NULL); break;
     case 2: draw_menu_row(ctx, cell_layer, "power off", NULL); break;
     case 3: draw_menu_row(ctx, cell_layer, "home", NULL); break;
-    default: draw_menu_row(ctx, cell_layer, "home (hold)", NULL); break;
+    case 4: draw_menu_row(ctx, cell_layer, "home (hold)", NULL); break;
+    default: draw_menu_row(ctx, cell_layer, "reload tv", NULL); break;
   }
 }
 
@@ -672,7 +673,8 @@ static void menu_select(MenuLayer *menu_layer, MenuIndex *cell_index, void *cont
   if (cell_index->row == 1) cmd = "power_on";
   else if (cell_index->row == 2) cmd = "power_off";
   else if (cell_index->row == 3) cmd = "home";
-  else cmd = "home_hold";
+  else if (cell_index->row == 4) cmd = "home_hold";
+  else cmd = "reload";
   send_command(cmd);
   vibes_short_pulse();
   window_stack_remove(s_menu_window, true);
@@ -771,7 +773,7 @@ static void down_click_handler(ClickRecognizerRef recognizer, void *context) {
 
 static void select_single_click_handler(ClickRecognizerRef recognizer, void *context) {
   note_activity();
-  send_command(s_remote_mode == 2 ? "menu" : "select");
+  send_command("select");   // always plain select, in every mode
 }
 
 static void select_long_click_handler(ClickRecognizerRef recognizer, void *context) {
