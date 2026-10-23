@@ -5,6 +5,27 @@ var activeEntityId = localStorage.getItem('active_tv_entity') || "";
 var MEDIA_OVERRIDES = {
 };
 
+// Optional: what "power on" should do for a TV that can't be woken through its integration
+// (for example an Android box in deep sleep). Key = the TV's entity in the watch's list.
+// Value = any Home Assistant action to run instead, such as pressing a Wake-on-LAN button
+// or running a script. Example:
+//   "remote.mi_box": { domain: "button", service: "press", entity_id: "button.mi_box_wake" }
+//   "remote.mi_box": { domain: "script", service: "turn_on", entity_id: "script.wake_mi_box" }
+var WAKE_ACTIONS = {
+};
+
+// Remotes to leave out of the watch's list, by entity ID, for anything the automatic
+// filter below doesn't catch. Example: ["remote.kitchen_speaker"]
+var HIDDEN_TVS = [];
+
+// HomePods show up as Apple TV remotes in Home Assistant, but their controls do nothing.
+// They're hidden when the device's model, or its name, says HomePod.
+function isHiddenTv(id, name, model) {
+  if (HIDDEN_TVS.indexOf(id) !== -1) return true;
+  return /homepod/i.test(String(model || '')) || /homepod/i.test(String(name || ''));
+}
+
+var tvTypes = {};       // entity -> 'apple' | 'android' | 'vidaa' | 'generic'
 var mediaMap = {};      // remote entity -> media_player entity (guessed from names)
 var pollTimer = null;
 
@@ -20,8 +41,21 @@ var lastActivity = Date.now();
 // VIDAA TVs are driven through Home Assistant button entities, named
 // button.<device>_<key>, exactly like your universal remote script. A TV counts as VIDAA
 // when "vidaa" appears in its entity name.
-function isVidaa(entityId) {
-  return entityId.split('.').pop().indexOf('vidaa') !== -1;
+// The kind of TV, found from the Home Assistant integration that owns it (see fetchRemotes).
+// Until that's known, fall back to guessing from the entity name.
+function tvType(entityId) {
+  if (tvTypes[entityId]) return tvTypes[entityId];
+  var name = entityId.split('.').pop();
+  if (name.indexOf('vidaa') !== -1) return 'vidaa';
+  if (/android|shield|fire/.test(name)) return 'android';
+  return 'generic';
+}
+
+function typeFromIntegration(integration) {
+  if (integration === 'apple_tv') return 'apple';
+  if (integration === 'androidtv_remote' || integration === 'androidtv') return 'android';
+  if (integration === 'vidaa_tv') return 'vidaa';
+  return 'generic';       // any other TV: standard Home Assistant commands
 }
 
 // Watch command -> the key part of the button entity name.
@@ -37,24 +71,22 @@ var VIDAA_KEYS = {
   'power_on': 'power', 'power_off': 'power'
 };
 
-function getDeviceCommand(entityId, cmd) {
-  var isAndroid = entityId.indexOf("android") !== -1 ||
-                  entityId.indexOf("shield") !== -1 ||
-                  entityId.indexOf("meo") !== -1 ||
-                  entityId.indexOf("fire") !== -1;
-  if (!isAndroid) {
-    // Apple TV: power goes through send_command too
-    var appleMap = { 'power_on': 'turn_on', 'power_off': 'turn_off' };
-    return appleMap[cmd] || cmd;
-  }
-  var androidMap = {
-    'up': 'DPAD_UP', 'down': 'DPAD_DOWN', 'left': 'DPAD_LEFT',
-    'right': 'DPAD_RIGHT', 'select': 'DPAD_CENTER', 'menu': 'BACK',
-    'volume_up': 'VOLUME_UP', 'volume_down': 'VOLUME_DOWN',
-    'home': 'HOME', 'home_hold': 'HOME',
-    'power_on': 'POWER', 'power_off': 'POWER'
-  };
-  return androidMap[cmd] || cmd;
+// Command names for remote.send_command, per kind of TV
+var ANDROID_KEYS = {
+  'up': 'DPAD_UP', 'down': 'DPAD_DOWN', 'left': 'DPAD_LEFT', 'right': 'DPAD_RIGHT',
+  'select': 'DPAD_CENTER', 'menu': 'BACK',
+  'volume_up': 'VOLUME_UP', 'volume_down': 'VOLUME_DOWN',
+  'home': 'HOME', 'home_hold': 'HOME',
+  'power_on': 'POWER', 'power_off': 'POWER'
+};
+var APPLE_KEYS = { 'power_on': 'turn_on', 'power_off': 'turn_off' };   // the rest are sent as-is
+// Plain names that Roku-style integrations accept. Other TVs may need a different set.
+var GENERIC_KEYS = { 'menu': 'back', 'home_hold': 'home' };
+
+function remoteCommand(type, cmd) {
+  if (type === 'android') return ANDROID_KEYS[cmd] || cmd;
+  if (type === 'apple') return APPLE_KEYS[cmd] || cmd;
+  return GENERIC_KEYS[cmd] || cmd;
 }
 
 function callService(domain, service, payload) {
@@ -76,16 +108,63 @@ function callService(domain, service, payload) {
 }
 
 function sendCommandToHA(commandName) {
-  if (isVidaa(activeEntityId)) {
-    var key = VIDAA_KEYS[commandName];
-    if (key) {
-      var base = activeEntityId.split('.').pop();
-      callService('button', 'press', { "entity_id": "button." + base + "_" + key });
+  var mp = mediaMap[activeEntityId];   // the TV's media_player, if we found one
+
+  // Reload the TV's integration in Home Assistant (for when a connection goes stale)
+  if (commandName === 'reload') {
+    callService('homeassistant', 'reload_config_entry', { "entity_id": mp || activeEntityId });
+    setTimeout(pollNowPlaying, 6000);
+    return;
+  }
+
+  // A custom wake action for this TV replaces the normal "power on"
+  if (commandName === 'power_on' && WAKE_ACTIONS[activeEntityId]) {
+    var w = WAKE_ACTIONS[activeEntityId];
+    callService(w.domain, w.service, { "entity_id": w.entity_id });
+    setTimeout(pollNowPlaying, 8000);
+    return;
+  }
+
+  var type = tvType(activeEntityId);
+
+  if (type === 'vidaa') {
+    // Power and volume go through the media player, the same calls HomeKit makes.
+    // Power on is a Wake-on-LAN packet there, so it works even when the TV's control
+    // connection is down. Everything else presses the TV's button entities.
+    var mpService = null;
+    if (commandName === 'power_on') mpService = 'turn_on';
+    else if (commandName === 'power_off') mpService = 'turn_off';
+    else if (commandName === 'volume_up') mpService = 'volume_up';
+    else if (commandName === 'volume_down') mpService = 'volume_down';
+
+    if (mpService && mp) {
+      callService('media_player', mpService, { "entity_id": mp });
+    } else {
+      var key = VIDAA_KEYS[commandName];
+      if (key) {
+        var base = activeEntityId.split('.').pop();
+        callService('button', 'press', { "entity_id": "button." + base + "_" + key });
+      }
+    }
+  } else if (type === 'generic') {
+    // A TV we don't recognize: use the standard Home Assistant actions where there is one
+    // (power and volume on its media player), and send the key names for the rest.
+    var generic = { 'power_on': 'turn_on', 'power_off': 'turn_off', 'volume_up': 'volume_up', 'volume_down': 'volume_down' }[commandName];
+    if (generic && mp) {
+      callService('media_player', generic, { "entity_id": mp });
+    } else if (generic && (commandName === 'power_on' || commandName === 'power_off')) {
+      callService('remote', generic, { "entity_id": activeEntityId });
+    } else {
+      callService('remote', 'send_command', {
+        "entity_id": activeEntityId,
+        "command": [remoteCommand('generic', commandName)]
+      });
     }
   } else {
+    // Apple TV and Android TV: remote.send_command with that kind's key names
     callService('remote', 'send_command', {
       "entity_id": activeEntityId,
-      "command": [getDeviceCommand(activeEntityId, commandName)]
+      "command": [remoteCommand(type, commandName)]
     });
   }
   // Refresh now-playing shortly after a command (pause, power, etc.)
@@ -236,12 +315,14 @@ var tvCache = null;   // [{ id: 'remote.x', name: 'X' }, ...]
 function loadCaches() {
   try { tvCache = JSON.parse(localStorage.getItem('tv_cache') || 'null'); } catch (e) { tvCache = null; }
   try { mediaMap = JSON.parse(localStorage.getItem('media_map') || '{}') || {}; } catch (e) { mediaMap = {}; }
+  try { tvTypes = JSON.parse(localStorage.getItem('tv_types') || '{}') || {}; } catch (e) { tvTypes = {}; }
 }
 
 function saveCaches() {
   try {
     localStorage.setItem('tv_cache', JSON.stringify(tvCache));
     localStorage.setItem('media_map', JSON.stringify(mediaMap));
+    localStorage.setItem('tv_types', JSON.stringify(tvTypes));
   } catch (e) { }
 }
 
@@ -271,6 +352,7 @@ function fetchRemotesFromStates(done) {
       remotes = remotes.filter(function(r) { return r.id.slice(7).indexOf(base) !== 0; });
       remotes.push({ id: 'button.' + base, name: String(it.attributes.friendly_name || base).replace(/\s+ok$/i, '') });
     });
+    remotes = remotes.filter(function(r) { return !isHiddenTv(r.id, r.name, ''); });
     done(remotes, buildMediaMap(states, remotes));
   };
   xhr.onerror = function() { done(null); };
@@ -291,8 +373,13 @@ function fetchRemotes(done) {
            "{% for e in device_entities(" + v + ") %}{% if e.startswith('media_player.') %}{{ e }} {% endif %}" +
            "{% endfor %}{% endif %}";
   }
+  // Which known integration owns an entity (empty if none of them)
+  function typeTpl(ent) {
+    return "{% for i in ['apple_tv','androidtv_remote','androidtv','vidaa_tv'] %}" +
+           "{% if " + ent + " in integration_entities(i) %}{{ i }}{% endif %}{% endfor %}";
+  }
   var tpl =
-    "{% for r in states.remote %}{{ r.entity_id }}\t{{ r.name }}\t" + mpFor("r.entity_id", "d") + "\t{{ d }}\n{% endfor %}" +
+    "{% for r in states.remote %}{{ r.entity_id }}\t{{ r.name }}\t" + mpFor("r.entity_id", "d") + "\t{{ d }}\t" + typeTpl("r.entity_id") + "\t{{ device_attr(d, 'model') if d else '' }}\n{% endfor %}" +
     "{% for b in states.button if 'vidaa' in b.entity_id and b.entity_id.endswith('_ok') %}" +
     "{{ b.entity_id }}\t{% set bd = device_id(b.entity_id) %}" +
     "{{ (device_attr(bd, 'name_by_user') or device_attr(bd, 'name')) if bd else b.name }}\t" +
@@ -304,7 +391,7 @@ function fetchRemotes(done) {
   xhr.setRequestHeader("Content-Type", "application/json");
   xhr.onload = function() {
     if (xhr.status === 200) {
-      var remotes = [], map = {}, buttons = [], devOf = {};
+      var remotes = [], map = {}, buttons = [], devOf = {}, types = {}, models = {};
       xhr.responseText.split('\n').forEach(function(line) {
         var p = line.split('\t');
         var id = trim(p[0]);
@@ -316,6 +403,9 @@ function fetchRemotes(done) {
           remotes.push({ id: id, name: name || id });
           if (mp) map[id] = mp;
           if (dev) devOf[id] = dev;
+          types[id] = typeFromIntegration(trim(p[4]));
+          var model = trim(p[5]);
+          if (model !== 'None') models[id] = model;
         } else if (id.indexOf('button.') === 0) {
           var base = id.slice(7).replace(/_ok$/, '');
           buttons.push({ id: 'button.' + base, name: name || base, mp: mp, dev: dev });
@@ -326,15 +416,18 @@ function fetchRemotes(done) {
       var buttonDevs = {};
       buttons.forEach(function(bt) { if (bt.dev) buttonDevs[bt.dev] = true; });
       remotes = remotes.filter(function(r) { return !(devOf[r.id] && buttonDevs[devOf[r.id]]); });
+      // Leave out HomePods and anything on the hidden list
+      remotes = remotes.filter(function(r) { return !isHiddenTv(r.id, r.name, models[r.id]); });
       // A VIDAA TV that also has a remote entity is already listed once; don't add it twice
       buttons.forEach(function(bt) {
         var dup = remotes.some(function(r) { return r.id.slice(7) === bt.id.slice(7); });
         if (!dup) {
           remotes.push({ id: bt.id, name: bt.name });
           if (bt.mp) map[bt.id] = bt.mp;
+          types[bt.id] = 'vidaa';
         }
       });
-      if (remotes.length) { done(remotes, map); return; }
+      if (remotes.length) { done(remotes, map, types); return; }
     }
     console.log("template lookup unusable (" + xhr.status + "), falling back to /api/states");
     fetchRemotesFromStates(done);
@@ -344,15 +437,18 @@ function fetchRemotes(done) {
 }
 
 // Store a fresh list + map. Returns true if anything changed.
-function applyRemotes(remotes, map) {
+function applyRemotes(remotes, map, types) {
   var newMap = {};
   Object.keys(map || {}).forEach(function(k) { newMap[k] = map[k]; });
   remotes.forEach(function(r) { if (MEDIA_OVERRIDES[r.id]) newMap[r.id] = MEDIA_OVERRIDES[r.id]; });
 
+  var newTypes = types || {};
   var changed = JSON.stringify(remotes) !== JSON.stringify(tvCache) ||
-                JSON.stringify(newMap) !== JSON.stringify(mediaMap);
+                JSON.stringify(newMap) !== JSON.stringify(mediaMap) ||
+                JSON.stringify(newTypes) !== JSON.stringify(tvTypes);
   tvCache = remotes;
   mediaMap = newMap;
+  tvTypes = newTypes;
   saveCaches();
 
   // If the saved TV is missing or gone, default to the first remote so buttons always work
@@ -362,7 +458,7 @@ function applyRemotes(remotes, map) {
     localStorage.setItem('active_tv_entity', activeEntityId);
     changed = true;
   }
-  console.log("media map: " + JSON.stringify(mediaMap));
+  console.log("media map: " + JSON.stringify(mediaMap) + " types: " + JSON.stringify(tvTypes));
   return changed;
 }
 
@@ -386,9 +482,9 @@ function sendListToWatch() {
 
 // Refresh from Home Assistant. Resends the list to the watch if asked to, or if it changed.
 function refreshRemotes(sendToWatch) {
-  fetchRemotes(function(remotes, map) {
+  fetchRemotes(function(remotes, map, types) {
     if (!remotes) return;
-    var changed = applyRemotes(remotes, map || {});
+    var changed = applyRemotes(remotes, map || {}, types);
     if (sendToWatch || changed) sendListToWatch();
     if (changed) pollNowPlaying();
   });
