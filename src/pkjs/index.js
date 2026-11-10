@@ -58,14 +58,11 @@ function typeFromIntegration(integration) {
   return 'generic';       // any other TV: standard Home Assistant commands
 }
 
-// Watch command -> the key part of the button entity name.
-// up/down/left/right/ok/stop/home come from your script (Back = stop, like there).
-// volume_* and power are my best guess: check the button entities your VIDAA TV
-// actually has in Home Assistant and edit these names if they differ.
+// up/down/left/right/ok/home map to the VIDAA integration's button entities.
+// Back ('menu') is handled separately with remote.send_command below.
 var VIDAA_KEYS = {
   'up': 'up', 'down': 'down', 'left': 'left', 'right': 'right',
   'select': 'ok',
-  'menu': 'stop',
   'home': 'home', 'home_hold': 'home',
   'volume_up': 'volume_up', 'volume_down': 'volume_down',
   'power_on': 'power', 'power_off': 'power'
@@ -137,12 +134,22 @@ function sendCommandToHA(commandName) {
     else if (commandName === 'volume_up') mpService = 'volume_up';
     else if (commandName === 'volume_down') mpService = 'volume_down';
 
+    var base = activeEntityId.split('.').pop();
+
     if (mpService && mp) {
       callService('media_player', mpService, { "entity_id": mp });
+    } else if (commandName === 'menu') {
+      // Back. Do NOT use button.<base>_back: the VIDAA integration wires that
+      // entity to the literal KEY_BACK, which this TV treats as rewind. And
+      // button.<base>_stop is KEY_STOP, which pauses.
+      // remote.send_command("back") resolves to KEY_RETURNS, the real Back key.
+      callService('remote', 'send_command', {
+        "entity_id": "remote." + base + "_remote",
+        "command": ["back"]
+      });
     } else {
       var key = VIDAA_KEYS[commandName];
       if (key) {
-        var base = activeEntityId.split('.').pop();
         callService('button', 'press', { "entity_id": "button." + base + "_" + key });
       }
     }
